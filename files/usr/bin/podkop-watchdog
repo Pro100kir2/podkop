@@ -1,0 +1,124 @@
+#!/bin/sh
+# podkop-watchdog: connectivity monitor and VLESS failover for Podkop.
+# Usage: podkop-watchdog run|tick|status|diagnose|test-candidates|help
+
+: "${WD_LIB_DIR:=/usr/lib/podkop-watchdog}"
+# Tests run with WD_STRICT=1 to catch unset variables; production stays resilient.
+[ "${WD_STRICT:-0}" = 1 ] && set -u
+
+for _m in common checks api candidate machine; do
+	# shellcheck disable=SC1090
+	. "$WD_LIB_DIR/$_m.sh" || {
+		echo "podkop-watchdog: cannot load $WD_LIB_DIR/$_m.sh" >&2
+		exit 1
+	}
+done
+
+acquire_lock() { # -n (fail fast)
+	exec 9>"$WD_LOCK_FILE" || return 1
+	flock -n 9
+}
+
+cmd_run() {
+	load_config
+	if [ "$C_ENABLED" != 1 ]; then
+		log notice "disabled in config; exiting"
+		exit 0
+	fi
+	ensure_dirs
+	if ! acquire_lock; then
+		log err "another instance is already running"
+		echo "podkop-watchdog: already running" >&2
+		exit 1
+	fi
+	_sleep_pid=''
+	trap 'log notice "stopping"; [ -n "$_sleep_pid" ] && kill "$_sleep_pid" 2>/dev/null; exit 0' TERM INT HUP
+	log notice "started"
+	while :; do
+		tick
+		# fd 9 closed: if we are SIGKILLed, an orphaned sleep must not hold the lock.
+		sleep "$DELAY" 8>&- 9>&- &
+		_sleep_pid=$!
+		wait "$_sleep_pid"
+		_sleep_pid=''
+	done
+}
+
+cmd_tick() {
+	load_config
+	ensure_dirs
+	if ! acquire_lock; then
+		echo "podkop-watchdog: already running" >&2
+		exit 1
+	fi
+	tick
+	echo "state=$S_STATE next_in=$DELAY"
+}
+
+cmd_status() {
+	load_config
+	if [ -f "$STATE_FILE" ]; then
+		cat "$STATE_FILE"
+	else
+		echo "no state yet ($STATE_FILE)"
+	fi
+	if [ -n "$(lkg_get)" ]; then
+		echo "LKG=present id=$(node_id "$(lkg_get)")"
+	else
+		echo "LKG=none"
+	fi
+	echo "ACTIVE_ID=$(node_id "$(current_proxy)")"
+}
+
+cmd_diagnose() {
+	load_config
+	ensure_dirs
+	diagnose
+	echo "$S_D_SUMMARY" | tr ',' '\n'
+	if api_req GET /health && [ "$(json_field status)" = ok ]; then
+		echo "api=1"
+	else
+		echo "api=0 ($(api_err_desc))"
+	fi
+	rm -f "$API_BODY"
+}
+
+# Dry run: fetch the subscription and test every node in isolation.
+# Does not change Podkop. Output contains node ids only.
+cmd_test_candidates() {
+	load_config
+	ensure_dirs
+	exec 8>"$WD_LOCK_FILE.test"
+	if ! flock -n 8; then
+		echo "a candidate test is already running" >&2
+		exit 1
+	fi
+	_f="$TMP_DIR/dryrun.candidates"
+	if ! api_req GET "/vless/sub?$C_SUB_QUERY"; then
+		echo "subscription fetch failed ($(api_err_desc))"
+		rm -f "$API_BODY"
+		exit 1
+	fi
+	_r=$(parse_subscription "$API_BODY" "$_f")
+	rm -f "$API_BODY"
+	echo "usable=${_r% *} rejected=${_r#* }"
+	_i=0
+	while IFS= read -r _u; do
+		_i=$((_i + 1))
+		if test_candidate "$_u"; then _res=pass; else _res="fail ($T_REASON)"; fi
+		echo "#$_i id=$(node_id "$_u") $_res"
+	done <"$_f"
+	rm -f "$_f"
+}
+
+case "${1:-}" in
+run) cmd_run ;;
+tick) cmd_tick ;;
+status) cmd_status ;;
+diagnose) cmd_diagnose ;;
+test-candidates) cmd_test_candidates ;;
+*)
+	echo "Usage: $0 run|tick|status|diagnose|test-candidates" >&2
+	exit 2
+	;;
+esac
