@@ -248,8 +248,8 @@ Recon (read-only):
   Note: `wireless.wifinet1.network='wan lan'` — 5 GHz AP is also attached to
   the `wan` network; looks unintended, not changed.
 * Hardware watchdog: `/dev/watchdog` fed by procd, `timeout 30`,
-  `magicclose false` — a kernel or procd hang reboots the router. A live test
-  requires a reboot and has not been done.
+  `magicclose false` — a kernel or procd hang reboots the router (live test
+  below).
 * Telegram: `api.telegram.org` resolves to a real IP (not in Podkop's
   `russia_inside` list) and times out directly from this ISP; through the
   active VLESS node via `sing-box tools fetch` it answers in ~4 s.
@@ -275,3 +275,20 @@ Design:
   Delivery: curl direct (URL via `-K -`, token not in argv) → isolated
   sing-box through the active node → through LKG. Serialised with candidate
   tests by the same lock.
+
+### Live test: hardware watchdog and boot (2026-10-27)
+
+* `ubus call system watchdog '{"stop": true}'` (owner approved the reboot):
+  procd closed `/dev/watchdog` without magic close; the router dropped off
+  the LAN 32 s later and booted (uptime 10.3 days → 0, no clean-shutdown
+  lines). procd re-armed the watchdog at ~14 s of uptime (`running`).
+* Boot: WAN set up at ~22 s, PPPoE connected by itself at ~26 s (CHAP in
+  3 s); podkop-watchdog started at ~25 s, waited the boot grace and reported
+  HEALTHY at ~130 s without any repair. The owner's "PPPoE does not come up
+  after a reboot" case did not reproduce this time.
+* No RTC: before NTP syncs, sysfixtime sets the clock to the newest file in
+  /etc (events showed 18:10 instead of 18:32). Event log lines now carry
+  `up=<seconds>` as well.
+* Seen on a service restart: the "stopping" line was missing — procd's
+  SIGKILL (5 s after TERM) can land while a tick runs a long probe, so the
+  TERM trap never runs. Harmless (state is saved before side effects).
