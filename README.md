@@ -8,7 +8,10 @@ node from the Scat API, applies it through Podkop's normal lifecycle,
 verifies it, and rolls back if verification fails. It also repairs the
 router itself: it restarts a WAN interface that stays without internet
 (e.g. PPPoE not coming up after boot), restarts a dead or broken dnsmasq,
-and reloads a stuck Podkop when the node itself still works.
+restarts a hung Wi-Fi radio, and reloads a stuck Podkop when the node itself
+still works. It reports what it did to Telegram and keeps a small event log.
+Podkop is one part of the router: router-level repairs run even when Podkop
+is stopped.
 
 * POSIX shell for busybox ash, ~1.2k lines. No Python, no new packages: uses
   `curl`, `jq`, `uci`, `ubus`, `nft`, `sing-box` already present with Podkop.
@@ -20,13 +23,14 @@ and reloads a stuck Podkop when the node itself still works.
 
 ```
 files/                              -> copied to / on the router
-  usr/bin/podkop-watchdog           CLI: run | tick | status | diagnose | test-candidates
+  usr/bin/podkop-watchdog           CLI: run | tick | status | diagnose | test-candidates | events | notify-test
   usr/lib/podkop-watchdog/
     common.sh                       config, state file, clock, locks, restart budget
     checks.sh                       read-only diagnostics and classification
     api.sh                          Scat API client, subscription validation
     candidate.sh                    isolated node tests, uci/Podkop apply, LKG
-    machine.sh                      recovery state machine (one step per tick)
+    machine.sh                      recovery state machine, WAN and Wi-Fi repair
+    notify.sh                       event log, Telegram notification queue
   etc/init.d/podkop-watchdog        procd init script
   etc/config/podkop-watchdog        UCI config, every option documented
   lib/upgrade/keep.d/podkop-watchdog  keeps the LKG across sysupgrade
@@ -41,12 +45,13 @@ Every `check_interval` (30 s) the service classifies the router:
 
 | Class | Meaning | Action |
 |---|---|---|
-| `PODKOP_OFF` | Podkop disabled or stopped on purpose (`shutdown_correctly=1`) | none |
+| `DNSMASQ_DOWN` | the router's DNS server (dnsmasq, used by every LAN client) is not running — checked first, with or without WAN or Podkop | `dnsmasq restart` after 3 checks, budgeted |
+| `PODKOP_OFF` | Podkop disabled or stopped on purpose (`shutdown_correctly=1`), router DNS answers | none |
+| `DNSMASQ_BROKEN` | Podkop off, dnsmasq running but not answering while direct DNS works | `dnsmasq restart`, budgeted |
 | `WAN_DOWN` | WAN link down, or neither ping targets nor a direct DNS query answer | no VPN action; the WAN repair below restarts the interface |
 | `PODKOP_DOWN` | sing-box not running or `PodkopTable` missing | `podkop reload` after 3 checks, budgeted |
 | `DNS_UPSTREAM_DOWN` | local DNS fails and Podkop's upstream resolver is unreachable | none |
 | `TUNNEL_DOWN` | real HTTP test through the active outbound (Clash API) fails | node failover after 3 checks |
-| `DNSMASQ_DOWN` | the router's DNS server (dnsmasq, used by every LAN client) is not running | `dnsmasq restart` after 3 checks, budgeted |
 | `DNS_CHAIN_DOWN` | dnsmasq → sing-box DNS broken, upstream fine | `podkop reload`; if that did not help, `dnsmasq restart` next; budgeted |
 | `PATH_DOWN` | node works but the fakeip/nft/tproxy path probe (`ip.podkop.fyi/check`, third-party) fails | none (logged once) |
 | `HEALTHY` | all good | records current node as last-known-good |
@@ -67,6 +72,41 @@ while Podkop is stopped and during 10-minute refresh waits).
   WAN device grows by ≥ 64 KiB per check while the router's own probes
   fail), a WAN stopped on purpose with `ifdown`, or an interface name that
   does not exist. `option wan_repair '0'` turns it off.
+* Traffic raises the bar: once LAN traffic was seen in an outage, 9 quiet
+  checks in a row are needed instead of 3. If LAN traffic still flows after a
+  restart while the router's own checks keep failing, the problem is on the
+  router, not the WAN: restarts need 15 min of total silence and the owner
+  is notified.
+
+## Wi-Fi repair
+
+Every minute, per radio enabled in `/etc/config/wireless`:
+
+* down although enabled (not pending), or an interface without its
+  hostapd/wpa_supplicant → restart that radio after 3 checks;
+* clients connected but not a single transmitted packet for 10 checks →
+  restart (stalled driver, e.g. mt7603);
+* restart = `ubus call network.wireless down/up {"device": "radioN"}` (no
+  `network reload`); backoff 5, 10, 20, 40 min, then hourly;
+* radios disabled in config or stopped with `wifi down` are never touched.
+
+## Notifications and event log
+
+* Telegram: set `telegram_token` and `telegram_chat_id` in
+  `/etc/config/podkop-watchdog`, then `podkop-watchdog notify-test`.
+  Messages (in Russian) cover WAN/Wi-Fi/DNS/Podkop repairs, VPN recovery,
+  "no working node" (hourly at most), failed repairs and router boot.
+  They are queued in RAM (max 30) and sent once the internet works —
+  directly, or through the active / last-known-good VLESS node in an isolated
+  sing-box when Telegram is blocked. The token is validated, never logged,
+  and passed to curl via stdin; through a node it is briefly visible in the
+  router's own process list.
+* Event log: notice/warning/error lines go to
+  `/etc/podkop-watchdog/events.log`, rotated at 64 KiB (two files max), so
+  history survives reboots and syslog floods. `podkop-watchdog events [N]`.
+* The hardware watchdog is OpenWrt's own: procd feeds `/dev/watchdog`
+  (30 s timeout), so a kernel or procd hang reboots the router; podkop-watchdog
+  then reports the boot.
 * Internet is "up" if any ping target answers or a direct DNS query works,
   so an ISP that filters ICMP is not mistaken for an outage.
 

@@ -16,7 +16,7 @@ put() { # local_rel remote_path mode
 	echo "installed $2"
 }
 
-for m in common checks api candidate machine; do
+for m in common checks api candidate machine notify; do
 	put "usr/lib/podkop-watchdog/$m.sh" "/usr/lib/podkop-watchdog/$m.sh" 644
 done
 put usr/bin/podkop-watchdog /usr/bin/podkop-watchdog 755

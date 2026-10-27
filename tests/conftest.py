@@ -20,6 +20,8 @@ FILES = ROOT / "files"
 SCRIPT = FILES / "usr/bin/podkop-watchdog"
 LIB = FILES / "usr/lib/podkop-watchdog"
 STUB = Path(__file__).with_name("stub.py")
+# Fake but well-formed bot token; must never show up anywhere but the request.
+TG_TOKEN = "123456789:AAFakeTokenForTestsOnly_abcdefghijk"
 SHELL = os.environ.get("WD_TEST_SHELL", "dash")
 
 STUB_COMMANDS = [
@@ -134,6 +136,7 @@ class Router:
             },
         }
         self.save()
+        (self.base / "hostname").write_text("TestRouter\n")
         self.set_time(1000)
 
     # ----------------------------------------------------------- world ---
@@ -171,6 +174,19 @@ class Router:
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(f"{rx_bytes}\n")
 
+    def set_tx(self, ifname: str, packets: int) -> None:
+        f = self.base / f"sysnet/{ifname}/statistics/tx_packets"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(f"{packets}\n")
+
+    def telegrams(self) -> list[dict[str, Any]]:
+        """Every delivery attempt: {"text", "via", "t"}."""
+        return self.calls("telegram")
+
+    def events(self) -> str:
+        f = self.persist_dir / "events.log"
+        return f.read_text() if f.exists() else ""
+
     def wan_restarts(self) -> list[dict[str, Any]]:
         return [c for c in self.calls("ifctl") if c["args"][0] == "up"]
 
@@ -196,6 +212,8 @@ class Router:
                 "WD_PODKOP_LIB": str(self.podkop_lib),
                 "WD_DNSMASQ_INIT": str(self.bin / "dnsmasq-init"),
                 "WD_SYS_NET": str(self.base / "sysnet"),
+                "WD_EVENT_LOG": str(self.persist_dir / "events.log"),
+                "WD_HOSTNAME_FILE": str(self.base / "hostname"),
                 "WD_STRICT": "1",
             }
         )
@@ -271,6 +289,9 @@ def router(tmp_path: Path) -> Iterator[Router]:
     # Secrets must never reach logs or the state file.
     logs = r.logs()
     state = (r.state_dir / "state").read_text() if (r.state_dir / "state").exists() else ""
+    calls = (r.base / "calls.jsonl").read_text() if (r.base / "calls.jsonl").exists() else ""
+    for text in (logs, state, r.events(), calls):
+        assert TG_TOKEN not in text, "telegram token leaked"
     for text in (logs, state):
         assert "vless://" not in text
         for url in r.urls.values():
