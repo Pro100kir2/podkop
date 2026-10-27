@@ -127,6 +127,10 @@ def cmd_podkop_init(args: list[str]) -> int:
             if rc:
                 return rc
         world["active"] = world["uci"].get("podkop.main.proxy_string", "")
+        if world.get("reload_revives"):  # a stuck sing-box: the node itself is fine
+            n = node(world, host_of(world["active"]))
+            n["live"] = n["isolated"]
+            world["nodes"][host_of(world["active"])] = n
         if world.get("reload_fixes", True):
             world["singbox"] = True
             world["nft"] = True
@@ -137,17 +141,32 @@ def cmd_podkop_init(args: list[str]) -> int:
 
 def cmd_ubus(args: list[str]) -> int:
     world = load()
-    obj = args[1]
+    obj, method = args[1], args[2]
     if obj == "network.interface.lan":
         print(json.dumps({"ipv4-address": [{"address": "192.168.1.1"}]}))
-    else:
-        print(json.dumps({"up": world["wan_up"], "l3_device": "pppoe-wan"}))
+        return 0
+    if obj != "network.interface.wan":
+        return 4  # UBUS_STATUS_NOT_FOUND
+    if method in ("down", "up"):
+        record("ifctl", [method])
+        world["wan_autostart"] = method == "up"
+        if method == "down":
+            world["wan_up"] = False
+        elif world.get("wan_restart_fixes"):
+            world["wan_up"] = True
+            world["internet"] = True
+        save(world)
+        return 0
+    status: dict[str, Any] = {"up": world["wan_up"], "autostart": world.get("wan_autostart", True)}
+    if world["wan_up"]:
+        status["l3_device"] = "pppoe-wan"
+    print(json.dumps(status))
     return 0
 
 
 def cmd_ping(args: list[str]) -> int:
     world = load()
-    return 0 if world["wan_up"] and world["internet"] else 1
+    return 0 if world["wan_up"] and world["internet"] and not world.get("icmp_blocked") else 1
 
 
 def cmd_nslookup(args: list[str]) -> int:
@@ -162,7 +181,20 @@ def cmd_nslookup(args: list[str]) -> int:
 
 
 def cmd_pidof(args: list[str]) -> int:
-    return 0 if load()["singbox"] else 1
+    world = load()
+    if args[-1] == "dnsmasq":
+        return 0 if world.get("dnsmasq", True) else 1
+    return 0 if world["singbox"] else 1
+
+
+def cmd_dnsmasq_init(args: list[str]) -> int:
+    world = load()
+    record("dnsmasq-init", args)
+    world["dnsmasq"] = True
+    if world.get("dnsmasq_restart_fixes", True):
+        world["dns"]["127.0.0.1"] = True
+    save(world)
+    return 0
 
 
 def cmd_nft(args: list[str]) -> int:
@@ -305,6 +337,7 @@ COMMANDS = {
     "logger": cmd_logger,
     "uci": cmd_uci,
     "podkop-init": cmd_podkop_init,
+    "dnsmasq-init": cmd_dnsmasq_init,
     "ubus": cmd_ubus,
     "ping": cmd_ping,
     "nslookup": cmd_nslookup,

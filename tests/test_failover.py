@@ -40,7 +40,8 @@ def test_active_node_failure_and_successful_failover(router: Router) -> None:
     assert len(router.reloads()) == 1
     assert router.lkg() == bare(u["b.example"])
     # The failing active node is not re-tested; b passes twice in isolation.
-    assert [c["args"][0] for c in router.calls("sing-box-fetch")] == ["b.example", "b.example"]
+    # The active node is self-tested once first (a stuck Podkop would be reloaded, not switched).
+    assert [c["args"][0] for c in router.calls("sing-box-fetch")] == ["a.example", "b.example", "b.example"]
     assert router.api_calls("POST /scan") == [] and router.api_calls("POST /cache/refresh") == []
     assert "recovery complete" in router.logs()
     # Subscription data is not kept after recovery.
@@ -221,7 +222,8 @@ def test_malformed_or_empty_subscription_is_rejected(router: Router, body: str) 
     router.set_api("GET /vless/sub", resp(body=body))
     router.set_api("POST /scan", resp(body={"outcome": "cached"}))
     router.run_until(lambda st: st["STATE"] == "SCAN")
-    assert router.calls("sing-box-fetch") == []
+    # Only the self-test of the active node; nothing from the rejected subscription.
+    assert [c["args"][0] for c in router.calls("sing-box-fetch")] == ["a.example"]
     assert router.load()["uci"]["podkop.main.proxy_string"] == router.urls["a.example"]
     assert "0 usable" in router.logs()
 

@@ -167,3 +167,66 @@ MONITOR --tunnel fails N times--> [LKG test] --> FETCH --> TEST --(pass)--> APPL
 * Run 2: dead node detected after 3 checks, `dd33449e` passed in isolation,
   applied, verified through Podkop; recovery took 80 s with one switch. Tunnel
   exit IP differs from the direct WAN IP.
+
+## 6. Router self-repair (2026-10-27)
+
+Requirement from the owner: the router is used by people who cannot fix it,
+so router-side faults must be repaired automatically, not only VPN faults.
+Concretely, after a reboot the PPPoE WAN on this router sometimes does not
+come up until the interface is restarted by hand.
+
+Recon (read-only): `network.wan` is `proto=pppoe` on device `wan`,
+`l3_device=pppoe-wan`; `/sbin/ifup` = `ubus call network reload` +
+`network.interface.<x> down` + `up`; `/sys/class/net/pppoe-wan/statistics/rx_bytes`
+exists. Boot logs of a failed start were no longer available (uptime 10 days),
+so the exact failure form is assumed (pppd retrying, or session up without traffic);
+the repair covers both because it only looks at "no internet".
+
+Design:
+
+* `wan_watch` runs first in every tick on its own timer (`WAN_AT`), so
+  neither Podkop being stopped nor long recovery waits delay it. The tick
+  now wakes at `min(DUE_AT, WAN_AT)`; `DUE_AT` is the state machine's own
+  schedule, `NEXT_AT` the persisted wake time (still prevents bursts on
+  respawn).
+* Repair = `ubus call network.interface.<wan> down; up` (no `network reload`:
+  pending network config must not be applied by the watchdog). Gated by
+  `wan_fail_threshold` checks, then exponential backoff 120 s → 1800 s cap.
+  State is saved before the call.
+* Guards against cutting off a working connection: an `rx_bytes` delta
+  ≥ `wan_rx_active_bytes` per check means LAN traffic flows → no restart;
+  `autostart=false` (set by a manual `ifdown`) → no restart unless the
+  watchdog itself did the down; unknown interface → inactive.
+* `internet_up` = any ping target OR a direct DNS query, so ICMP filtering
+  is not an outage.
+* dnsmasq: `DNSMASQ_DOWN` (process missing while local DNS fails) →
+  `/etc/init.d/dnsmasq restart`; `DNS_CHAIN_DOWN` alternates Podkop reload →
+  dnsmasq restart. Both use the shared restart budget.
+* `SELFTEST`: before switching nodes, the current node is tested in
+  isolation; if it works, Podkop is reloaded instead (at most once per hour),
+  which covers a sing-box left stale by a WAN flap.
+
+Not live-tested yet: an actual WAN restart on this router (needs the owner's
+go-ahead because it drops the internet for the test).
+
+### Live test of WAN repair (2026-10-27, router 192.168.1.1)
+
+* **A, manual stop:** `ubus call network.interface.wan down` sets
+  `autostart=false` (confirmed). The watchdog logged the manual stop and did
+  not restart the WAN for 150 s (`WAN_NOTE=manual`, 0 restarts). WAN brought
+  back by hand; internet in ~5 s.
+* **B, stuck session:** temporary nft table dropping router input/output on
+  the current `pppoe-wan` (ifindex 15; the forward chain failed to load, so LAN
+  traffic kept flowing — effectively the "router probes fail, LAN works"
+  case). Timeline: block 15:40:30 → WAN_DOWN at the next check → the rx guard
+  held off restarts while LAN traffic flowed → after 3 consecutive quiet checks
+  `ubus down/up` at 15:45:58 → PPPoE up in 4 s (new ifindex 16) → watchdog
+  confirmed "WAN is up again after 1 interface restart(s)" at 15:46:57.
+* After the reconnect the active node e8aaa8d3 was dead (also failed the
+  isolated self-test), so the full recovery ran: 5 nodes failed, scan, cache
+  refresh, node 9b4f6e6a passed and was verified through Podkop at 15:54:06.
+  Router and LAN internet confirmed afterwards; class HEALTHY.
+* Observed: with WAN down, sing-box floods syslog with DNS errors (668 of 696
+  lines), pushing older entries out of the ring buffer.
+* The rx guard is a heuristic: it protects a WAN with steady LAN traffic, but
+  three quiet checks in a row still allow a restart (~5 s LAN interruption).

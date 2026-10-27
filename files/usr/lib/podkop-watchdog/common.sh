@@ -10,6 +10,8 @@
 : "${WD_MEMINFO_FILE:=/proc/meminfo}"
 : "${WD_PODKOP_INIT:=/etc/init.d/podkop}"
 : "${WD_PODKOP_LIB:=/usr/lib/podkop}"
+: "${WD_DNSMASQ_INIT:=/etc/init.d/dnsmasq}"
+: "${WD_SYS_NET:=/sys/class/net}"
 
 STATE_FILE="$WD_STATE_DIR/state"
 CAND_FILE="$WD_STATE_DIR/candidates"
@@ -93,6 +95,12 @@ cfg_defaults() {
 	C_BOOT_GRACE=120
 	C_PERSIST_LKG=1
 	C_API_CHECK_INTERVAL=600
+	C_WAN_REPAIR=1
+	C_WAN_FAIL_THRESHOLD=3
+	C_WAN_SETTLE=60
+	C_WAN_REPAIR_BACKOFF=120
+	C_WAN_REPAIR_MAX_INTERVAL=1800
+	C_WAN_RX_ACTIVE_BYTES=65536
 }
 
 # Explicit whitelist: config values are never eval'd.
@@ -117,6 +125,9 @@ cfg_assign() { # name value
 	refresh_interval) C_REFRESH_INTERVAL=$2 ;; restart_min_interval) C_RESTART_MIN_INTERVAL=$2 ;;
 	restart_max_per_hour) C_RESTART_MAX_PER_HOUR=$2 ;; boot_grace) C_BOOT_GRACE=$2 ;;
 	persist_lkg) C_PERSIST_LKG=$2 ;; api_check_interval) C_API_CHECK_INTERVAL=$2 ;;
+	wan_repair) C_WAN_REPAIR=$2 ;; wan_fail_threshold) C_WAN_FAIL_THRESHOLD=$2 ;;
+	wan_settle) C_WAN_SETTLE=$2 ;; wan_repair_backoff) C_WAN_REPAIR_BACKOFF=$2 ;;
+	wan_repair_max_interval) C_WAN_REPAIR_MAX_INTERVAL=$2 ;; wan_rx_active_bytes) C_WAN_RX_ACTIVE_BYTES=$2 ;;
 	*) log warning "unknown config option '$1' ignored" ;;
 	esac
 }
@@ -173,6 +184,11 @@ EOF
 	cfg_int C_RESTART_MAX_PER_HOUR 6 1 60
 	cfg_int C_BOOT_GRACE 120 0 1800
 	cfg_int C_API_CHECK_INTERVAL 600 60 86400
+	cfg_int C_WAN_FAIL_THRESHOLD 3 2 100
+	cfg_int C_WAN_SETTLE 60 10 600
+	cfg_int C_WAN_REPAIR_BACKOFF 120 60 3600
+	cfg_int C_WAN_REPAIR_MAX_INTERVAL 1800 300 86400
+	cfg_int C_WAN_RX_ACTIVE_BYTES 65536 1024 1073741824
 
 	case "$C_API_BASE" in
 	https://*) ;;
@@ -201,7 +217,8 @@ state_defaults() {
 	S_ATTEMPT=0 S_CAND_IDX=0 S_APPLIES=0 S_VERIFY_N=0 S_LAST_REFRESH_AT=''
 	S_DEADLINE=0 S_RESTARTS='' S_LAST_CLASS='' S_LAST_API_AT=0 S_API_OK=''
 	S_REC_STARTED=0 S_CYCLE=0 S_FAILED_IDS='' S_LAST_QCHECK=0 S_NOTE=''
-	S_APPLIED_ID='' S_D_SUMMARY=''
+	S_APPLIED_ID='' S_D_SUMMARY='' S_DUE_AT=0 S_SELF_AT=0 S_DNS_ESC=0
+	S_WAN_AT=0 S_WAN_FAIL_N=0 S_WAN_FIXES=0 S_WAN_REPAIR_AT=0 S_WAN_RX='' S_WAN_NOTE=''
 }
 
 # Known keys only; values are plain tokens written by save_state.
@@ -220,14 +237,19 @@ load_state() {
 		LAST_API_AT) S_LAST_API_AT=$_v ;; API_OK) S_API_OK=$_v ;; REC_STARTED) S_REC_STARTED=$_v ;;
 		CYCLE) S_CYCLE=$_v ;; FAILED_IDS) S_FAILED_IDS=$_v ;; LAST_QCHECK) S_LAST_QCHECK=$_v ;;
 		NOTE) S_NOTE=$_v ;; APPLIED_ID) S_APPLIED_ID=$_v ;; D_SUMMARY) S_D_SUMMARY=$_v ;;
+		DUE_AT) S_DUE_AT=$_v ;; SELF_AT) S_SELF_AT=$_v ;; DNS_ESC) S_DNS_ESC=$_v ;;
+		WAN_AT) S_WAN_AT=$_v ;; WAN_FAIL_N) S_WAN_FAIL_N=$_v ;; WAN_FIXES) S_WAN_FIXES=$_v ;;
+		WAN_REPAIR_AT) S_WAN_REPAIR_AT=$_v ;; WAN_RX) S_WAN_RX=$_v ;; WAN_NOTE) S_WAN_NOTE=$_v ;;
 		esac
 	done <"$STATE_FILE"
 	for _n in NEXT_AT FAIL_N OK_N PK_FAIL_N ATTEMPT CAND_IDX APPLIES VERIFY_N DEADLINE \
-		LAST_API_AT REC_STARTED CYCLE LAST_QCHECK; do
+		LAST_API_AT REC_STARTED CYCLE LAST_QCHECK DUE_AT SELF_AT DNS_ESC WAN_AT WAN_FAIL_N \
+		WAN_FIXES WAN_REPAIR_AT; do
 		eval "_v=\$S_$_n"
 		is_uint "$_v" || eval "S_$_n=0"
 	done
 	is_uint "$S_LAST_REFRESH_AT" || S_LAST_REFRESH_AT=''
+	is_uint "$S_WAN_RX" || S_WAN_RX=''
 	return 0
 }
 
@@ -256,6 +278,15 @@ save_state() {
 		echo "NOTE=$S_NOTE"
 		echo "APPLIED_ID=$S_APPLIED_ID"
 		echo "D_SUMMARY=$S_D_SUMMARY"
+		echo "DUE_AT=$S_DUE_AT"
+		echo "SELF_AT=$S_SELF_AT"
+		echo "DNS_ESC=$S_DNS_ESC"
+		echo "WAN_AT=$S_WAN_AT"
+		echo "WAN_FAIL_N=$S_WAN_FAIL_N"
+		echo "WAN_FIXES=$S_WAN_FIXES"
+		echo "WAN_REPAIR_AT=$S_WAN_REPAIR_AT"
+		echo "WAN_RX=$S_WAN_RX"
+		echo "WAN_NOTE=$S_WAN_NOTE"
 	} | write_atomic "$STATE_FILE"
 }
 

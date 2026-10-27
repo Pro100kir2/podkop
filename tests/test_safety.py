@@ -144,12 +144,14 @@ def test_local_dns_chain_failure_reloads_podkop_with_budget(router: Router) -> N
     def broken_dns_chain(w: dict) -> None:
         w["dns"]["127.0.0.1"] = False
         w["reload_fixes"] = False  # a reload does not fix it
+        w["dnsmasq_restart_fixes"] = False  # neither does a dnsmasq restart
 
     router.update(broken_dns_chain)
     router.set_config(restart_max_per_hour="2", restart_min_interval="60")
     start = router.now
     router.run_until(lambda st: router.now - start >= 3000, max_steps=500)
-    assert len(router.reloads()) == 2  # budget respected
+    # Podkop reload first, then dnsmasq; both share one budget.
+    assert len(router.reloads()) == 1 and len(router.calls("dnsmasq-init")) == 1
     assert "restart budget exhausted" in router.logs()
     assert router.calls("sing-box-fetch") == []  # not a node problem
 

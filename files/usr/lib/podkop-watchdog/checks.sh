@@ -1,5 +1,5 @@
 # podkop-watchdog: diagnostics. Read-only: nothing here changes system state.
-# shellcheck shell=sh disable=SC2034 # globals are shared across sourced modules
+# shellcheck shell=sh disable=SC2034,SC2153 # globals are shared across sourced modules
 
 podkop_get() { uci -q get "podkop.$1" 2>/dev/null; }
 
@@ -16,19 +16,44 @@ direct_dns() {
 	echo "$_d"
 }
 
-wan_link_up() {
+# Sets W_LINK (netifd says up), W_AUTO (0 = stopped on purpose with ifdown)
+# and W_L3 (layer-3 device, e.g. pppoe-wan). Fails if the interface is unknown.
+wan_status() {
+	W_LINK=0 W_AUTO=1 W_L3=''
 	_st=$(ubus call "network.interface.$C_WAN_INTERFACE" status 2>/dev/null) || return 1
-	[ "$(printf '%s' "$_st" | jq -r '.up' 2>/dev/null)" = true ]
+	_f=$(printf '%s' "$_st" | jq -r '[.up, .autostart, (.l3_device // "")] | map(tostring) | join(" ")' 2>/dev/null) ||
+		return 1
+	# shellcheck disable=SC2086 # split the three fields
+	set -- $_f
+	[ "${1:-}" = true ] && W_LINK=1
+	[ "${2:-}" = false ] && W_AUTO=0
+	W_L3=${3:-}
+	return 0
 }
 
+wan_link_up() { wan_status && [ "$W_LINK" = 1 ]; }
+
+# ICMP to any target, or a direct DNS query (some ISPs filter ICMP).
 internet_up() {
 	for _t in $C_INTERNET_TARGET; do
 		ping -c 1 -W 2 "$_t" >/dev/null 2>&1 && return 0
 	done
-	return 1
+	dns_ok "$(direct_dns)"
 }
 
 wan_ok() { wan_link_up && internet_up; }
+
+wan_rx_bytes() { # device
+	case "$1" in '' | */* | .*) return 1 ;; esac
+	_f="$WD_SYS_NET/$1/statistics/rx_bytes"
+	[ -r "$_f" ] || return 1
+	_rx=''
+	read -r _rx <"$_f" || return 1
+	is_uint "$_rx" || return 1
+	echo "$_rx"
+}
+
+dnsmasq_running() { pidof dnsmasq >/dev/null 2>&1; }
 
 # User intent: Podkop enabled at boot and not deliberately stopped.
 podkop_intent_on() {
@@ -124,9 +149,14 @@ tunnel_state() { # dns_local_ok(1/0)
 # Sets D_* variables and D_CLASS. See docs/DESIGN.md for precedence.
 diagnose() {
 	D_WAN=0 D_INET=0 D_INTENT=0 D_SB=0 D_NFT=0 D_DNS=0 D_DNS_PK=- D_DNS_DIRECT=-
-	D_NODE=- D_PATH=-
-	wan_link_up && D_WAN=1
-	[ "$D_WAN" = 1 ] && internet_up && D_INET=1
+	D_NODE=- D_PATH=- D_DNSMASQ=-
+	if [ "${W_CHECKED:-0}" = 1 ]; then
+		# Already probed by wan_watch in this tick.
+		D_WAN=$W_LINK D_INET=$W_INET
+	else
+		wan_link_up && D_WAN=1
+		[ "$D_WAN" = 1 ] && internet_up && D_INET=1
+	fi
 	podkop_intent_on && D_INTENT=1
 	singbox_running && D_SB=1
 	podkop_nft_ok && D_NFT=1
@@ -140,6 +170,7 @@ diagnose() {
 	else
 		dns_ok 127.0.0.1 && D_DNS=1
 		if [ "$D_DNS" = 0 ]; then
+			dnsmasq_running && D_DNSMASQ=1 || D_DNSMASQ=0
 			if [ "$(podkop_get settings.dns_type)" = udp ]; then
 				_pk=$(podkop_get settings.dns_server)
 				_pk=${_pk%%:*}
@@ -154,7 +185,10 @@ diagnose() {
 			full_path_ok && D_PATH=1 || D_PATH=0
 		fi
 
-		if [ "$D_DNS" = 0 ] && { [ "$D_DNS_PK" = 0 ] || { [ "$D_DNS_PK" = - ] && [ "$D_DNS_DIRECT" = 0 ]; }; }; then
+		if [ "$D_DNSMASQ" = 0 ]; then
+			# The router's own DNS server (used by every LAN client) is not running.
+			D_CLASS=DNSMASQ_DOWN
+		elif [ "$D_DNS" = 0 ] && { [ "$D_DNS_PK" = 0 ] || { [ "$D_DNS_PK" = - ] && [ "$D_DNS_DIRECT" = 0 ]; }; }; then
 			# Podkop's own upstream resolver is unreachable: not fixable by a restart or node switch.
 			D_CLASS=DNS_UPSTREAM_DOWN
 		elif [ "$D_NODE" = fail ]; then
@@ -169,5 +203,5 @@ diagnose() {
 			D_CLASS=HEALTHY
 		fi
 	fi
-	S_D_SUMMARY="class=$D_CLASS,wan=$D_WAN,inet=$D_INET,podkop=$D_INTENT,singbox=$D_SB,nft=$D_NFT,dns=$D_DNS,dns_podkop=$D_DNS_PK,dns_direct=$D_DNS_DIRECT,node=$D_NODE,path=$D_PATH"
+	S_D_SUMMARY="class=$D_CLASS,wan=$D_WAN,inet=$D_INET,podkop=$D_INTENT,singbox=$D_SB,nft=$D_NFT,dns=$D_DNS,dns_podkop=$D_DNS_PK,dns_direct=$D_DNS_DIRECT,dnsmasq=$D_DNSMASQ,node=$D_NODE,path=$D_PATH"
 }

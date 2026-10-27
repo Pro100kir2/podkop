@@ -5,7 +5,10 @@ Autonomous recovery service for OpenWrt routers running
 and the active VLESS tunnel, tells apart ISP/DNS/API outages from a broken
 node, and, only when the node itself is broken, picks a working VLESS
 node from the Scat API, applies it through Podkop's normal lifecycle,
-verifies it, and rolls back if verification fails.
+verifies it, and rolls back if verification fails. It also repairs the
+router itself: it restarts a WAN interface that stays without internet
+(e.g. PPPoE not coming up after boot), restarts a dead or broken dnsmasq,
+and reloads a stuck Podkop when the node itself still works.
 
 * POSIX shell for busybox ash, ~1.2k lines. No Python, no new packages: uses
   `curl`, `jq`, `uci`, `ubus`, `nft`, `sing-box` already present with Podkop.
@@ -39,18 +42,39 @@ Every `check_interval` (30 s) the service classifies the router:
 | Class | Meaning | Action |
 |---|---|---|
 | `PODKOP_OFF` | Podkop disabled or stopped on purpose (`shutdown_correctly=1`) | none |
-| `WAN_DOWN` | WAN link down or no direct internet target answers | none (logged once) |
+| `WAN_DOWN` | WAN link down, or neither ping targets nor a direct DNS query answer | no VPN action; the WAN repair below restarts the interface |
 | `PODKOP_DOWN` | sing-box not running or `PodkopTable` missing | `podkop reload` after 3 checks, budgeted |
 | `DNS_UPSTREAM_DOWN` | local DNS fails and Podkop's upstream resolver is unreachable | none |
 | `TUNNEL_DOWN` | real HTTP test through the active outbound (Clash API) fails | node failover after 3 checks |
-| `DNS_CHAIN_DOWN` | dnsmasq → sing-box DNS broken, upstream fine | `podkop reload`, budgeted |
+| `DNSMASQ_DOWN` | the router's DNS server (dnsmasq, used by every LAN client) is not running | `dnsmasq restart` after 3 checks, budgeted |
+| `DNS_CHAIN_DOWN` | dnsmasq → sing-box DNS broken, upstream fine | `podkop reload`; if that did not help, `dnsmasq restart` next; budgeted |
 | `PATH_DOWN` | node works but the fakeip/nft/tproxy path probe (`ip.podkop.fyi/check`, third-party) fails | none (logged once) |
 | `HEALTHY` | all good | records current node as last-known-good |
+
+## WAN repair
+
+Runs on its own 30 s timer, whatever Podkop or the recovery is doing (also
+while Podkop is stopped and during 10-minute refresh waits).
+
+* After 3 consecutive checks without internet (after the 120 s boot grace),
+  the WAN interface is restarted with `ubus call network.interface.wan
+  down` + `up` — the same down/up that `ifup wan` does, minus its
+  `network reload`, so no other interface or pending config is touched. First restart ≈ 3 min after boot.
+* Next restarts back off: 2, 4, 8, 16 min, then every 30 min while the ISP
+  stays down. A restart while the ISP is down costs nothing (the WAN is
+  already dead), and the LAN/router admin are never touched.
+* Never restarts a WAN that is carrying traffic (receive counter of the
+  WAN device grows by ≥ 64 KiB per check while the router's own probes
+  fail), a WAN stopped on purpose with `ifdown`, or an interface name that
+  does not exist. `option wan_repair '0'` turns it off.
+* Internet is "up" if any ping target answers or a direct DNS query works,
+  so an ISP that filters ICMP is not mistaken for an outage.
 
 ## Recovery state machine
 
 ```
-MONITOR ──TUNNEL_DOWN ×3──▶ (LKG first, if different from current)
+MONITOR ──TUNNEL_DOWN ×3──▶ SELFTEST: current node works in isolation? ──yes──▶ podkop reload, back to MONITOR
+   │                         (at most once per hour)                  no ──▶ (LKG first, if different from current)
    ▲                           │
    │                     FETCH /vless/sub ──▶ TEST (isolated sing-box, one node per tick)
    │                           ▲                  │ pass                 │ none left

@@ -51,6 +51,21 @@ config watchdog 'main'
 	option check_full_path '1'
 	option full_path_url 'https://ip.podkop.fyi/check'
 
+	# --- WAN repair: restart the WAN interface (ubus down/up, like LuCI's
+	# "Restart") when it stays without internet, e.g. PPPoE not coming up
+	# after boot. Never touches a WAN that carries traffic or one stopped
+	# manually with ifdown. 0 disables.
+	option wan_repair '1'
+	# Consecutive failed checks (check_interval apart) before a restart.
+	option wan_fail_threshold '3'
+	# Seconds to let the interface come up after a restart.
+	option wan_settle '60'
+	# Minimum gap between restarts; doubles each time, capped below.
+	option wan_repair_backoff '120'
+	option wan_repair_max_interval '1800'
+	# Received bytes per check above which the WAN counts as "in use".
+	option wan_rx_active_bytes '65536'
+
 	# --- Candidate tests (isolated sing-box, live connection untouched)
 	option candidate_test_url 'https://www.cloudflare.com/cdn-cgi/trace'
 	# Fixed string that must appear in the response body.

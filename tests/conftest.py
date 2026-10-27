@@ -26,6 +26,7 @@ STUB_COMMANDS = [
     "logger",
     "uci",
     "podkop-init",
+    "dnsmasq-init",
     "ubus",
     "ping",
     "nslookup",
@@ -164,6 +165,15 @@ class Router:
     def set_mem(self, kb: int) -> None:
         self.meminfo.write_text(f"MemTotal: 119244 kB\nMemAvailable: {kb} kB\n")
 
+    def set_rx(self, rx_bytes: int) -> None:
+        """WAN receive counter as the kernel exposes it in sysfs."""
+        f = self.base / "sysnet/pppoe-wan/statistics/rx_bytes"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(f"{rx_bytes}\n")
+
+    def wan_restarts(self) -> list[dict[str, Any]]:
+        return [c for c in self.calls("ifctl") if c["args"][0] == "up"]
+
     # ----------------------------------------------------------- clock ---
     def set_time(self, t: int) -> None:
         self.now = t
@@ -184,6 +194,8 @@ class Router:
                 "WD_MEMINFO_FILE": str(self.meminfo),
                 "WD_PODKOP_INIT": str(self.bin / "podkop-init"),
                 "WD_PODKOP_LIB": str(self.podkop_lib),
+                "WD_DNSMASQ_INIT": str(self.bin / "dnsmasq-init"),
+                "WD_SYS_NET": str(self.base / "sysnet"),
                 "WD_STRICT": "1",
             }
         )
