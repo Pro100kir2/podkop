@@ -12,6 +12,8 @@
 : "${WD_PODKOP_LIB:=/usr/lib/podkop}"
 : "${WD_DNSMASQ_INIT:=/etc/init.d/dnsmasq}"
 : "${WD_SYS_NET:=/sys/class/net}"
+: "${WD_EVENT_LOG:=$WD_PERSIST_DIR/events.log}"
+: "${WD_HOSTNAME_FILE:=/proc/sys/kernel/hostname}"
 
 STATE_FILE="$WD_STATE_DIR/state"
 CAND_FILE="$WD_STATE_DIR/candidates"
@@ -25,6 +27,7 @@ log() { # level message...
 	_lvl="$1"
 	shift
 	logger -t podkop-watchdog -p "daemon.$_lvl" -- "$*" 2>/dev/null || true
+	case "$_lvl" in err | warning | notice) event_write "$_lvl" "$*" ;; esac
 }
 
 now_s() {
@@ -101,6 +104,13 @@ cfg_defaults() {
 	C_WAN_REPAIR_BACKOFF=120
 	C_WAN_REPAIR_MAX_INTERVAL=1800
 	C_WAN_RX_ACTIVE_BYTES=65536
+	C_WIFI_REPAIR=1
+	C_WIFI_STALL_CHECKS=10
+	C_EVENT_LOG=1
+	C_EVENT_LOG_MAX_KB=64
+	C_NOTIFY=1
+	C_TG_TOKEN=''
+	C_TG_CHAT=''
 }
 
 # Explicit whitelist: config values are never eval'd.
@@ -128,6 +138,9 @@ cfg_assign() { # name value
 	wan_repair) C_WAN_REPAIR=$2 ;; wan_fail_threshold) C_WAN_FAIL_THRESHOLD=$2 ;;
 	wan_settle) C_WAN_SETTLE=$2 ;; wan_repair_backoff) C_WAN_REPAIR_BACKOFF=$2 ;;
 	wan_repair_max_interval) C_WAN_REPAIR_MAX_INTERVAL=$2 ;; wan_rx_active_bytes) C_WAN_RX_ACTIVE_BYTES=$2 ;;
+	wifi_repair) C_WIFI_REPAIR=$2 ;; wifi_stall_checks) C_WIFI_STALL_CHECKS=$2 ;;
+	event_log) C_EVENT_LOG=$2 ;; event_log_max_kb) C_EVENT_LOG_MAX_KB=$2 ;;
+	notify) C_NOTIFY=$2 ;; telegram_token) C_TG_TOKEN=$2 ;; telegram_chat_id) C_TG_CHAT=$2 ;;
 	*) log warning "unknown config option '$1' ignored" ;;
 	esac
 }
@@ -189,6 +202,17 @@ EOF
 	cfg_int C_WAN_REPAIR_BACKOFF 120 60 3600
 	cfg_int C_WAN_REPAIR_MAX_INTERVAL 1800 300 86400
 	cfg_int C_WAN_RX_ACTIVE_BYTES 65536 1024 1073741824
+	cfg_int C_WIFI_STALL_CHECKS 10 3 1000
+	cfg_int C_EVENT_LOG_MAX_KB 64 8 1024
+	# The token ends up in a URL: accept only the documented formats (never log it).
+	if [ -n "$C_TG_TOKEN" ] && ! printf '%s' "$C_TG_TOKEN" | grep -Eq '^[0-9]{1,20}:[A-Za-z0-9_-]{20,100}$'; then
+		log err "telegram_token has an invalid format; notifications disabled"
+		C_TG_TOKEN=''
+	fi
+	if [ -n "$C_TG_CHAT" ] && ! printf '%s' "$C_TG_CHAT" | grep -Eq '^(-?[0-9]{1,20}|@[A-Za-z0-9_]{5,64})$'; then
+		log err "telegram_chat_id has an invalid format; notifications disabled"
+		C_TG_CHAT=''
+	fi
 
 	case "$C_API_BASE" in
 	https://*) ;;
@@ -219,6 +243,8 @@ state_defaults() {
 	S_REC_STARTED=0 S_CYCLE=0 S_FAILED_IDS='' S_LAST_QCHECK=0 S_NOTE=''
 	S_APPLIED_ID='' S_D_SUMMARY='' S_DUE_AT=0 S_SELF_AT=0 S_DNS_ESC=0
 	S_WAN_AT=0 S_WAN_FAIL_N=0 S_WAN_FIXES=0 S_WAN_REPAIR_AT=0 S_WAN_RX='' S_WAN_NOTE=''
+	S_WAN_TRAFFIC=0 S_WAN_SUSPECT=0 S_WAN_DOWN_AT=0 S_WIFI_AT=0 S_NOTIFY_AT=0 S_NOTIFY_FAILS=0
+	S_NO_NODE_AT=0
 }
 
 # Known keys only; values are plain tokens written by save_state.
@@ -240,11 +266,15 @@ load_state() {
 		DUE_AT) S_DUE_AT=$_v ;; SELF_AT) S_SELF_AT=$_v ;; DNS_ESC) S_DNS_ESC=$_v ;;
 		WAN_AT) S_WAN_AT=$_v ;; WAN_FAIL_N) S_WAN_FAIL_N=$_v ;; WAN_FIXES) S_WAN_FIXES=$_v ;;
 		WAN_REPAIR_AT) S_WAN_REPAIR_AT=$_v ;; WAN_RX) S_WAN_RX=$_v ;; WAN_NOTE) S_WAN_NOTE=$_v ;;
+		WAN_TRAFFIC) S_WAN_TRAFFIC=$_v ;; WAN_SUSPECT) S_WAN_SUSPECT=$_v ;; WAN_DOWN_AT) S_WAN_DOWN_AT=$_v ;;
+		WIFI_AT) S_WIFI_AT=$_v ;; NOTIFY_AT) S_NOTIFY_AT=$_v ;; NOTIFY_FAILS) S_NOTIFY_FAILS=$_v ;;
+		NO_NODE_AT) S_NO_NODE_AT=$_v ;;
 		esac
 	done <"$STATE_FILE"
 	for _n in NEXT_AT FAIL_N OK_N PK_FAIL_N ATTEMPT CAND_IDX APPLIES VERIFY_N DEADLINE \
 		LAST_API_AT REC_STARTED CYCLE LAST_QCHECK DUE_AT SELF_AT DNS_ESC WAN_AT WAN_FAIL_N \
-		WAN_FIXES WAN_REPAIR_AT; do
+		WAN_FIXES WAN_REPAIR_AT WAN_TRAFFIC WAN_SUSPECT WAN_DOWN_AT WIFI_AT NOTIFY_AT NOTIFY_FAILS \
+		NO_NODE_AT; do
 		eval "_v=\$S_$_n"
 		is_uint "$_v" || eval "S_$_n=0"
 	done
@@ -287,6 +317,13 @@ save_state() {
 		echo "WAN_REPAIR_AT=$S_WAN_REPAIR_AT"
 		echo "WAN_RX=$S_WAN_RX"
 		echo "WAN_NOTE=$S_WAN_NOTE"
+		echo "WAN_TRAFFIC=$S_WAN_TRAFFIC"
+		echo "WAN_SUSPECT=$S_WAN_SUSPECT"
+		echo "WAN_DOWN_AT=$S_WAN_DOWN_AT"
+		echo "WIFI_AT=$S_WIFI_AT"
+		echo "NOTIFY_AT=$S_NOTIFY_AT"
+		echo "NOTIFY_FAILS=$S_NOTIFY_FAILS"
+		echo "NO_NODE_AT=$S_NO_NODE_AT"
 	} | write_atomic "$STATE_FILE"
 }
 

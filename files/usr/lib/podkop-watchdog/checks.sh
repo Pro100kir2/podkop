@@ -55,6 +55,32 @@ wan_rx_bytes() { # device
 
 dnsmasq_running() { pidof dnsmasq >/dev/null 2>&1; }
 
+# One line per radio that is enabled in config:
+#   <radio> <up> <pending> <autostart> <ifname,ifname|->
+wifi_radios() {
+	ubus call network.wireless status 2>/dev/null | jq -r '
+		to_entries[] | select(.value.disabled != true)
+		| ([.value.interfaces[]?.ifname // empty] | join(",")) as $i
+		| "\(.key) \(.value.up) \(.value.pending) \(.value.autostart) \(if $i == "" then "-" else $i end)"' 2>/dev/null
+}
+
+# hostapd (AP) or wpa_supplicant (client) must be serving the interface.
+wifi_daemon_ok() { # ifname
+	ubus list "hostapd.$1" >/dev/null 2>&1 || ubus list "wpa_supplicant.$1" >/dev/null 2>&1
+}
+
+wifi_clients() { # ifname
+	_wc=$(ubus call "hostapd.$1" get_clients 2>/dev/null | jq -r '.clients // {} | length' 2>/dev/null)
+	is_uint "$_wc" && echo "$_wc" || echo 0
+}
+
+wifi_tx_packets() { # ifname
+	case "$1" in '' | */* | .*) echo 0; return ;; esac
+	_wt=''
+	[ -r "$WD_SYS_NET/$1/statistics/tx_packets" ] && read -r _wt <"$WD_SYS_NET/$1/statistics/tx_packets"
+	is_uint "$_wt" && echo "$_wt" || echo 0
+}
+
 # User intent: Podkop enabled at boot and not deliberately stopped.
 podkop_intent_on() {
 	"$WD_PODKOP_INIT" enabled >/dev/null 2>&1 || return 1
@@ -147,9 +173,11 @@ tunnel_state() { # dns_local_ok(1/0)
 }
 
 # Sets D_* variables and D_CLASS. See docs/DESIGN.md for precedence.
+# Router-level faults (dnsmasq, WAN) are classified first and independently
+# of Podkop: Podkop is one part of the router, not the whole of it.
 diagnose() {
 	D_WAN=0 D_INET=0 D_INTENT=0 D_SB=0 D_NFT=0 D_DNS=0 D_DNS_PK=- D_DNS_DIRECT=-
-	D_NODE=- D_PATH=- D_DNSMASQ=-
+	D_NODE=- D_PATH=- D_DNSMASQ=0
 	if [ "${W_CHECKED:-0}" = 1 ]; then
 		# Already probed by wan_watch in this tick.
 		D_WAN=$W_LINK D_INET=$W_INET
@@ -157,20 +185,30 @@ diagnose() {
 		wan_link_up && D_WAN=1
 		[ "$D_WAN" = 1 ] && internet_up && D_INET=1
 	fi
+	dnsmasq_running && D_DNSMASQ=1
 	podkop_intent_on && D_INTENT=1
 	singbox_running && D_SB=1
 	podkop_nft_ok && D_NFT=1
 
-	if [ "$D_INTENT" = 0 ]; then
-		D_CLASS=PODKOP_OFF
+	if [ "$D_DNSMASQ" = 0 ]; then
+		# The router's DNS server (used by every LAN client) is not running.
+		D_CLASS=DNSMASQ_DOWN
 	elif [ "$D_WAN" = 0 ] || [ "$D_INET" = 0 ]; then
 		D_CLASS=WAN_DOWN
+	elif [ "$D_INTENT" = 0 ]; then
+		# Podkop is off on purpose; the router's own DNS must still answer.
+		dns_ok 127.0.0.1 && D_DNS=1
+		if [ "$D_DNS" = 1 ]; then
+			D_CLASS=PODKOP_OFF
+		else
+			dns_ok "$(direct_dns)" && D_DNS_DIRECT=1 || D_DNS_DIRECT=0
+			if [ "$D_DNS_DIRECT" = 1 ]; then D_CLASS=DNSMASQ_BROKEN; else D_CLASS=DNS_UPSTREAM_DOWN; fi
+		fi
 	elif [ "$D_SB" = 0 ] || [ "$D_NFT" = 0 ]; then
 		D_CLASS=PODKOP_DOWN
 	else
 		dns_ok 127.0.0.1 && D_DNS=1
 		if [ "$D_DNS" = 0 ]; then
-			dnsmasq_running && D_DNSMASQ=1 || D_DNSMASQ=0
 			if [ "$(podkop_get settings.dns_type)" = udp ]; then
 				_pk=$(podkop_get settings.dns_server)
 				_pk=${_pk%%:*}
@@ -185,10 +223,7 @@ diagnose() {
 			full_path_ok && D_PATH=1 || D_PATH=0
 		fi
 
-		if [ "$D_DNSMASQ" = 0 ]; then
-			# The router's own DNS server (used by every LAN client) is not running.
-			D_CLASS=DNSMASQ_DOWN
-		elif [ "$D_DNS" = 0 ] && { [ "$D_DNS_PK" = 0 ] || { [ "$D_DNS_PK" = - ] && [ "$D_DNS_DIRECT" = 0 ]; }; }; then
+		if [ "$D_DNS" = 0 ] && { [ "$D_DNS_PK" = 0 ] || { [ "$D_DNS_PK" = - ] && [ "$D_DNS_DIRECT" = 0 ]; }; }; then
 			# Podkop's own upstream resolver is unreachable: not fixable by a restart or node switch.
 			D_CLASS=DNS_UPSTREAM_DOWN
 		elif [ "$D_NODE" = fail ]; then

@@ -1,12 +1,12 @@
 #!/bin/sh
 # podkop-watchdog: connectivity monitor and VLESS failover for Podkop.
-# Usage: podkop-watchdog run|tick|status|diagnose|test-candidates|help
+# Usage: podkop-watchdog run|tick|status|diagnose|test-candidates|events|notify-test
 
 : "${WD_LIB_DIR:=/usr/lib/podkop-watchdog}"
 # Tests run with WD_STRICT=1 to catch unset variables; production stays resilient.
 [ "${WD_STRICT:-0}" = 1 ] && set -u
 
-for _m in common checks api candidate machine; do
+for _m in common checks api candidate machine notify; do
 	# shellcheck disable=SC1090
 	. "$WD_LIB_DIR/$_m.sh" || {
 		echo "podkop-watchdog: cannot load $WD_LIB_DIR/$_m.sh" >&2
@@ -111,14 +111,44 @@ cmd_test_candidates() {
 	rm -f "$_f"
 }
 
+# Important events (notice and above), oldest first.
+cmd_events() {
+	_n=${1:-50}
+	is_uint "$_n" || _n=50
+	cat "$WD_EVENT_LOG.1" "$WD_EVENT_LOG" 2>/dev/null | tail -n "$_n"
+}
+
+# Send a test Telegram message right now (checks token, chat id and delivery path).
+cmd_notify_test() {
+	load_config
+	ensure_dirs
+	if ! notify_enabled; then
+		echo "notifications are not configured (notify, telegram_token, telegram_chat_id)" >&2
+		exit 1
+	fi
+	exec 8>"$WD_LOCK_FILE.test"
+	flock -n 8 || {
+		echo "a candidate test is running; try again later" >&2
+		exit 1
+	}
+	if tg_send "[$(router_name)] Проверка уведомлений podkop-watchdog: всё работает."; then
+		echo "sent"
+	else
+		echo "not delivered (no direct access and no working VPN node?)" >&2
+		exit 1
+	fi
+}
+
 case "${1:-}" in
 run) cmd_run ;;
 tick) cmd_tick ;;
 status) cmd_status ;;
 diagnose) cmd_diagnose ;;
 test-candidates) cmd_test_candidates ;;
+events) cmd_events "${2:-50}" ;;
+notify-test) cmd_notify_test ;;
 *)
-	echo "Usage: $0 run|tick|status|diagnose|test-candidates" >&2
+	echo "Usage: $0 run|tick|status|diagnose|test-candidates|events [N]|notify-test" >&2
 	exit 2
 	;;
 esac

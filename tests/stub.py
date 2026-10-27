@@ -52,6 +52,18 @@ def active_live(world: dict[str, Any]) -> bool:
     return bool(active) and node(world, host_of(active))["live"]
 
 
+def tg_path(url: str) -> str:
+    """Path with the token masked, so call logs can be checked for leaks separately."""
+    path = urlsplit(url).path
+    return re.sub(r"^/bot[^/]+/", "/bot<token>/", path)
+
+
+def tg_text(url: str) -> str:
+    from urllib.parse import parse_qs
+
+    return parse_qs(urlsplit(url).query).get("text", [""])[0]
+
+
 # --------------------------------------------------------------- commands ---
 
 
@@ -139,9 +151,58 @@ def cmd_podkop_init(args: list[str]) -> int:
     return 0
 
 
+def wifi_status(world: dict[str, Any]) -> dict[str, Any]:
+    out = {}
+    for name, r in world.get("wifi", {}).items():
+        ifaces = [{"section": f"if{i}", "ifname": f} for i, f in enumerate(r["ifaces"])] if r["up"] else []
+        out[name] = {
+            "up": r["up"],
+            "pending": r.get("pending", False),
+            "autostart": r.get("autostart", True),
+            "disabled": r.get("disabled", False),
+            "interfaces": ifaces,
+        }
+    return out
+
+
+def cmd_ubus_wireless(world: dict[str, Any], method: str, payload: str) -> int:
+    if method == "status":
+        print(json.dumps(wifi_status(world)))
+        return 0
+    dev = json.loads(payload)["device"]
+    record("wifictl", [method, dev])
+    radio = world["wifi"][dev]
+    radio["autostart"] = method == "up"
+    if method == "down":
+        radio["up"] = False
+    else:
+        radio["up"] = True
+        if world.get("wifi_restart_fixes", True):
+            radio["daemon"] = True
+    save(world)
+    return 0
+
+
 def cmd_ubus(args: list[str]) -> int:
     world = load()
+    if args[0] == "list":
+        name = args[1]
+        for radio in world.get("wifi", {}).values():
+            served = {f"hostapd.{f}" for f in radio["ifaces"]}
+            if radio["up"] and radio.get("daemon", True) and name in served:
+                print(name)
+                return 0
+        return 4
     obj, method = args[1], args[2]
+    if obj == "network.wireless":
+        return cmd_ubus_wireless(world, method, args[3] if len(args) > 3 else "{}")
+    if obj.startswith("hostapd."):
+        ifname = obj.split(".", 1)[1]
+        for radio in world.get("wifi", {}).values():
+            if ifname in radio["ifaces"] and radio["up"] and radio.get("daemon", True):
+                print(json.dumps({"clients": {f"aa:{i}": {} for i in range(radio.get("clients", 0))}}))
+                return 0
+        return 4
     if obj == "network.interface.lan":
         print(json.dumps({"ipv4-address": [{"address": "192.168.1.1"}]}))
         return 0
@@ -150,11 +211,16 @@ def cmd_ubus(args: list[str]) -> int:
     if method in ("down", "up"):
         record("ifctl", [method])
         world["wan_autostart"] = method == "up"
+        # A restart helps only a stuck session (wan_restart_fixes); it cannot fix
+        # the ISP (internet) or a missing cable (link down before the restart).
         if method == "down":
+            world["link_before_restart"] = world["wan_up"]
             world["wan_up"] = False
         elif world.get("wan_restart_fixes"):
             world["wan_up"] = True
             world["internet"] = True
+        else:
+            world["wan_up"] = world.get("link_before_restart", False)
         save(world)
         return 0
     status: dict[str, Any] = {"up": world["wan_up"], "autostart": world.get("wan_autostart", True)}
@@ -225,6 +291,13 @@ def cmd_sing_box(args: list[str]) -> int:
     if args[0] == "check":
         return 0
     # tools fetch
+    url = args[-1]
+    if url.startswith("https://api.telegram.org/"):
+        record("telegram", [tg_path(url)], via=host, text=tg_text(url))
+        if world["wan_up"] and world["internet"] and node(world, host)["isolated"]:
+            print('{"ok":true,"result":{}}')
+            return 0
+        return 1
     record("sing-box-fetch", [host])
     if world["wan_up"] and world["internet"] and node(world, host)["isolated"]:
         print("fl=1f1\nh=www.cloudflare.com\nip=203.0.113.9\n")
@@ -310,6 +383,16 @@ def cmd_curl(args: list[str]) -> int:
         if ok:
             return reply(200, '{"fakeip": true, "IP": "203.0.113.5"}')
         return reply(0, "", rc=28)
+
+    if "-K" in args:  # Telegram: the URL comes via a curl config on stdin
+        conf = sys.stdin.read()
+        m = re.search(r'url = "([^"]+)"', conf)
+        tg_url = m.group(1) if m else ""
+        record("telegram", [tg_path(tg_url)], via="direct", text=tg_text(tg_url))
+        if world["wan_up"] and world["internet"] and world.get("tg_direct", False):
+            sys.stdout.write('{"ok":true,"result":{}}')
+            return 0
+        return 28
 
     base = "https://api.scat-search.ru/api"
     if url.startswith(base):

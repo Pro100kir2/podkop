@@ -55,7 +55,7 @@ st_monitor() {
 		S_FAIL_N=$((S_FAIL_N + 1))
 		[ "$S_FAIL_N" -ge "$C_TUNNEL_FAIL_THRESHOLD" ] && start_recovery
 		;;
-	PODKOP_DOWN | DNS_CHAIN_DOWN | DNSMASQ_DOWN)
+	PODKOP_DOWN | DNS_CHAIN_DOWN | DNSMASQ_DOWN | DNSMASQ_BROKEN)
 		S_OK_N=0 S_FAIL_N=0
 		S_PK_FAIL_N=$((S_PK_FAIL_N + 1))
 		[ "$S_PK_FAIL_N" -ge "$C_PODKOP_FAIL_THRESHOLD" ] && try_podkop_restart
@@ -66,18 +66,24 @@ st_monitor() {
 try_podkop_restart() {
 	_w=$(restart_wait)
 	if [ "$_w" -gt 0 ]; then
-		note_once budget warning "Podkop unhealthy ($D_CLASS), restart budget exhausted; next allowed in ${_w}s"
+		if [ "$S_NOTE" != budget ]; then
+			notify "Сбой ($D_CLASS) не устраняется: лимит перезапусков исчерпан, следующая попытка через $((_w / 60 + 1)) мин."
+		fi
+		note_once budget warning "router service unhealthy ($D_CLASS), restart budget exhausted; next allowed in ${_w}s"
 		return
 	fi
 	record_restart
-	if [ "$D_CLASS" = DNSMASQ_DOWN ] || { [ "$D_CLASS" = DNS_CHAIN_DOWN ] && [ "$S_DNS_ESC" = 1 ]; }; then
-		# A Podkop reload did not bring local DNS back: restart the router's DNS server.
+	if [ "$D_CLASS" = DNSMASQ_DOWN ] || [ "$D_CLASS" = DNSMASQ_BROKEN ] ||
+		{ [ "$D_CLASS" = DNS_CHAIN_DOWN ] && [ "$S_DNS_ESC" = 1 ]; }; then
+		# dnsmasq is dead or not answering, or a Podkop reload did not bring local DNS back.
 		log warning "router DNS unhealthy ($D_CLASS) for $S_PK_FAIL_N checks; restarting dnsmasq"
+		notify "DNS роутера не отвечал (у устройств «нет интернета»). Перезапустил dnsmasq."
 		S_PK_FAIL_N=0 S_NOTE='' S_DNS_ESC=0
 		save_state
 		"$WD_DNSMASQ_INIT" restart >/dev/null 2>&1 8>&- 9>&- || log err "dnsmasq restart returned an error"
 	else
 		log warning "Podkop unhealthy ($D_CLASS) for $S_PK_FAIL_N checks; reloading Podkop"
+		notify "Podkop работал со сбоем ($D_CLASS). Перезапустил Podkop."
 		S_PK_FAIL_N=0 S_NOTE=''
 		[ "$D_CLASS" = DNS_CHAIN_DOWN ] && S_DNS_ESC=1
 		save_state
@@ -152,6 +158,7 @@ st_selftest() {
 		return
 	fi
 	log warning "active node id=$(node_id "$_cur") works in isolation; reloading Podkop instead of switching"
+	notify "VPN не работал, хотя узел исправен. Перезапустил Podkop."
 	record_restart
 	end_recovery
 	S_LAST_CLASS=''
@@ -163,6 +170,7 @@ st_selftest() {
 end_recovery() {
 	rm -f "$CAND_FILE" "$ROLLBACK_FILE"
 	S_PHASE='' S_CAND_IDX=0 S_APPLIES=0 S_FAILED_IDS='' S_FAIL_N=0 S_VERIFY_N=0 S_NOTE='' S_APPLIED_ID=''
+	S_NO_NODE_AT=0
 	set_state MONITOR
 }
 
@@ -239,6 +247,11 @@ advance_phase() {
 		_due=$((${S_LAST_REFRESH_AT:-0} + C_REFRESH_INTERVAL - $(now_s)))
 		[ "$_due" -lt 0 ] && _due=0
 		log warning "no working node found (cycle $S_CYCLE); next cache refresh in ${_due}s"
+		# Once when it starts, then at most hourly.
+		if [ "$S_NO_NODE_AT" = 0 ] || [ $(($(now_s) - S_NO_NODE_AT)) -ge 3600 ]; then
+			S_NO_NODE_AT=$(now_s)
+			notify "VPN не работает: рабочих узлов пока нет (цикл $S_CYCLE). Продолжаю искать каждые 10 мин; обычный интернет работает."
+		fi
 		;;
 	esac
 	DELAY=1
@@ -404,6 +417,7 @@ st_verify() {
 	if [ "$_ok" = 1 ]; then
 		lkg_set "$(current_proxy)"
 		log notice "recovery complete: node id=$S_APPLIED_ID verified through Podkop ($(($(now_s) - S_REC_STARTED))s, $S_APPLIES switch(es))"
+		notify "VPN восстановлен: новый узел id=$S_APPLIED_ID, за $((($(now_s) - S_REC_STARTED) / 60)) мин."
 		end_recovery
 		S_OK_N=$C_TUNNEL_OK_THRESHOLD
 		S_LAST_CLASS=HEALTHY
@@ -572,10 +586,17 @@ wan_watch() {
 	fi
 
 	if [ "$W_INET" = 1 ]; then
-		[ "$S_WAN_FIXES" -gt 0 ] && log notice "WAN is up again after $S_WAN_FIXES interface restart(s)"
-		S_WAN_FAIL_N=0 S_WAN_FIXES=0 S_WAN_REPAIR_AT=0 S_WAN_NOTE=''
+		if [ "$S_WAN_FIXES" -gt 0 ]; then
+			log notice "WAN is up again after $S_WAN_FIXES interface restart(s)"
+			notify "Интернет восстановлен после $S_WAN_FIXES перезапуск(ов) WAN, простой ~$(((_wnow - S_WAN_DOWN_AT) / 60)) мин."
+		elif [ "$S_WAN_SUSPECT" = 1 ]; then
+			notify "Проверки роутера снова проходят."
+		fi
+		S_WAN_FAIL_N=0 S_WAN_FIXES=0 S_WAN_REPAIR_AT=0 S_WAN_NOTE='' S_WAN_TRAFFIC=0 S_WAN_SUSPECT=0
+		S_WAN_DOWN_AT=0
 		return 0
 	fi
+	[ "$S_WAN_DOWN_AT" = 0 ] && S_WAN_DOWN_AT=$_wnow
 	if [ "$W_AUTO" = 0 ] && [ "$S_WAN_FIXES" = 0 ]; then
 		wnote manual notice "WAN interface '$C_WAN_INTERFACE' was stopped manually; not restarting it"
 		S_WAN_FAIL_N=0
@@ -583,12 +604,24 @@ wan_watch() {
 	fi
 	if [ "$_delta" -ge "$C_WAN_RX_ACTIVE_BYTES" ]; then
 		# The router's own probes fail but traffic flows: do not cut working clients off.
-		wnote traffic warning "connectivity checks fail but WAN is carrying traffic; not restarting it"
-		S_WAN_FAIL_N=0
+		S_WAN_TRAFFIC=1 S_WAN_FAIL_N=0
+		if [ "$S_WAN_FIXES" -gt 0 ] && [ "$S_WAN_SUSPECT" = 0 ]; then
+			# A restart did not make the probes pass, yet LAN traffic flows:
+			# the WAN works and the problem is on the router's side.
+			S_WAN_SUSPECT=1
+			log warning "LAN traffic flows but the router's own checks still fail after a WAN restart; WAN restarts held back"
+			notify "Устройства в сети пользуются интернетом, но проверки самого роутера не проходят. WAN перезапущу, только если трафик полностью пропадёт на 15 мин."
+		else
+			wnote traffic warning "connectivity checks fail but WAN is carrying traffic; not restarting it"
+		fi
 		return 0
 	fi
 	S_WAN_FAIL_N=$((S_WAN_FAIL_N + 1))
-	[ "$S_WAN_FAIL_N" -lt "$C_WAN_FAIL_THRESHOLD" ] && return 0
+	# The more evidence that the WAN works, the longer it must stay silent first.
+	_thr=$C_WAN_FAIL_THRESHOLD
+	[ "$S_WAN_TRAFFIC" = 1 ] && _thr=$((C_WAN_FAIL_THRESHOLD * 3))
+	[ "$S_WAN_SUSPECT" = 1 ] && _thr=$((C_WAN_FAIL_THRESHOLD * 10))
+	[ "$S_WAN_FAIL_N" -lt "$_thr" ] && return 0
 	if [ "$S_WAN_REPAIR_AT" -gt "$_wnow" ]; then
 		wnote wait info "WAN still down; next interface restart in $((S_WAN_REPAIR_AT - _wnow))s"
 		return 0
@@ -598,12 +631,101 @@ wan_watch() {
 	[ "$S_WAN_FIXES" -le 12 ] && _b=$((C_WAN_REPAIR_BACKOFF << (S_WAN_FIXES - 1)))
 	[ "$_b" -gt "$C_WAN_REPAIR_MAX_INTERVAL" ] && _b=$C_WAN_REPAIR_MAX_INTERVAL
 	log warning "WAN without internet for $S_WAN_FAIL_N checks (link=$W_LINK); restarting interface '$C_WAN_INTERFACE' (attempt $S_WAN_FIXES)"
+	case "$S_WAN_FIXES" in
+	1) notify "Нет интернета ~$(((_wnow - S_WAN_DOWN_AT) / 60)) мин. Перезапускаю WAN." ;;
+	3) notify "Перезапуски WAN не помогают (3 попытки). Вероятно, проблема у провайдера или с кабелем. Продолжаю пробовать каждые до 30 мин." ;;
+	esac
 	S_WAN_REPAIR_AT=$((_wnow + _b))
 	S_WAN_FAIL_N=0 S_WAN_NOTE='' S_WAN_RX=''
 	S_WAN_AT=$((_wnow + C_WAN_SETTLE))
 	save_state # persist first: a crash here must not cause a restart burst
 	wan_restart || log err "WAN interface restart returned an error"
 	return 1
+}
+
+# ---------------------------------------------------------- Wi-Fi repair ---
+
+# Per-radio state: "<radio> <fail_n> <stall_n> <tx> <fixes> <repair_at> <note>"
+WIFI_STATE="$WD_STATE_DIR/wifi"
+
+wifi_restart() { # radio
+	_wj="{\"device\":\"$1\"}"
+	ubus call network.wireless down "$_wj" >/dev/null 2>&1 8>&- 9>&-
+	ubus call network.wireless up "$_wj" >/dev/null 2>&1 8>&- 9>&- ||
+		ubus call network.wireless up "$_wj" >/dev/null 2>&1 8>&- 9>&-
+}
+
+# Restarts a single radio that is enabled in config but down, lost its
+# hostapd/wpa_supplicant, or stopped transmitting while clients are connected.
+# Radios disabled in config or stopped with `wifi down` are left alone.
+wifi_watch() {
+	[ "$C_WIFI_REPAIR" = 1 ] || return 0
+	_inow=$(now_s)
+	[ "$S_WIFI_AT" -gt "$_inow" ] && return 0
+	S_WIFI_AT=$((_inow + 2 * C_CHECK_INTERVAL))
+	_radios=$(wifi_radios) || return 0
+	[ -n "$_radios" ] || return 0
+	_inew="$WIFI_STATE.new"
+	: >"$_inew"
+	printf '%s\n' "$_radios" | while read -r _r _up _pend _auto _ifs; do
+		printf '%s' "$_r" | grep -Eq '^[A-Za-z0-9_]+$' || continue
+		_fail=0 _stall=0 _tx0='' _fix=0 _rat=0 _note=-
+		if [ -f "$WIFI_STATE" ]; then
+			# shellcheck disable=SC2034 # _x is the radio name column
+			read -r _x _fail _stall _tx0 _fix _rat _note <<EOF2
+$(grep "^$_r " "$WIFI_STATE")
+EOF2
+		fi
+		for _v in _fail _stall _fix _rat; do eval "is_uint \"\$$_v\" || $_v=0"; done
+		_why=''
+		if [ "$_auto" = false ] && [ "$_fix" = 0 ]; then
+			[ "$_note" = manual ] || log notice "Wi-Fi $_r was stopped manually; not restarting it"
+			echo "$_r 0 0 - 0 0 manual" >>"$_inew"
+			continue
+		fi
+		_tx=0 _cl=0
+		if [ "$_up" != true ]; then
+			[ "$_pend" = true ] || _why=down
+		elif [ "$_ifs" != - ]; then
+			for _if in $(echo "$_ifs" | tr ',' ' '); do
+				wifi_daemon_ok "$_if" || _why=nodaemon
+				_tx=$((_tx + $(wifi_tx_packets "$_if")))
+				_cl=$((_cl + $(wifi_clients "$_if")))
+			done
+		fi
+		if [ -z "$_why" ] && [ "$_up" = true ] && [ "$_cl" -gt 0 ] && [ "$_tx0" = "$_tx" ]; then
+			_stall=$((_stall + 1))
+			[ "$_stall" -ge "$C_WIFI_STALL_CHECKS" ] && _why=stalled
+		else
+			_stall=0
+		fi
+		if [ -z "$_why" ]; then
+			if [ "$_fix" -gt 0 ]; then
+				log notice "Wi-Fi $_r works again after $_fix restart(s)"
+				notify "Wi-Fi ($_r) снова работает после $_fix перезапуск(ов)."
+			fi
+			echo "$_r 0 $_stall $_tx 0 0 -" >>"$_inew"
+			continue
+		fi
+		_fail=$((_fail + 1))
+		if { [ "$_why" != stalled ] && [ "$_fail" -lt 3 ]; } || [ "$_rat" -gt "$_inow" ]; then
+			echo "$_r $_fail $_stall $_tx $_fix $_rat $_why" >>"$_inew"
+			continue
+		fi
+		_fix=$((_fix + 1))
+		_b=3600
+		[ "$_fix" -le 4 ] && _b=$((300 << (_fix - 1)))
+		[ "$_b" -gt 3600 ] && _b=3600
+		log warning "Wi-Fi $_r unhealthy ($_why); restarting it (attempt $_fix)"
+		case "$_fix" in
+		1) notify "Wi-Fi ($_r) не работает ($_why). Перезапускаю." ;;
+		3) notify "Перезапуски Wi-Fi ($_r) не помогают (3 попытки). Может понадобиться перезагрузка роутера." ;;
+		esac
+		echo "$_r 0 0 - $_fix $((_inow + _b)) restarted" >>"$_inew"
+		wifi_restart "$_r" || log err "Wi-Fi $_r restart returned an error"
+	done
+	mv -f "$_inew" "$WIFI_STATE"
+	return 0
 }
 
 tick() {
@@ -614,6 +736,7 @@ tick() {
 		S_NEXT_AT=$C_BOOT_GRACE S_DUE_AT=$C_BOOT_GRACE
 		DELAY=$((C_BOOT_GRACE - _tnow))
 		log info "boot grace: first check in ${DELAY}s"
+		notify "Роутер включился (перезагрузка или отключение питания). Проверю всё через $DELAY с."
 		save_state
 		return
 	fi
@@ -649,10 +772,13 @@ tick() {
 	elif [ "$S_DUE_AT" -lt "$S_WAN_AT" ]; then
 		S_DUE_AT=$S_WAN_AT # let the WAN settle before the next recovery step
 	fi
+	wifi_watch
+	notify_flush
 	# Wake for whichever comes first: the next state step or the next WAN check.
 	_tnow=$(now_s)
 	_wake=$S_DUE_AT
 	[ "$C_WAN_REPAIR" = 1 ] && [ "$S_WAN_AT" -lt "$_wake" ] && _wake=$S_WAN_AT
+	[ "$C_WIFI_REPAIR" = 1 ] && [ "$S_WIFI_AT" -lt "$_wake" ] && _wake=$S_WIFI_AT
 	[ "$_wake" -le "$_tnow" ] && _wake=$((_tnow + 1))
 	S_NEXT_AT=$_wake
 	DELAY=$((_wake - _tnow))

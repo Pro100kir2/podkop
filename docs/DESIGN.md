@@ -230,3 +230,48 @@ go-ahead because it drops the internet for the test).
   lines), pushing older entries out of the ring buffer.
 * The rx guard is a heuristic: it protects a WAN with steady LAN traffic, but
   three quiet checks in a row still allow a restart (~5 s LAN interruption).
+
+## 7. Whole-router scope, Wi-Fi, notifications (2026-10-27)
+
+Owner's decisions: the service is an independent fixer for the whole router;
+Podkop is one part of it. Add Wi-Fi repair, Telegram notifications and a
+size-capped event log; tighten the WAN traffic guard; verify the hardware
+watchdog.
+
+Recon (read-only):
+
+* Wi-Fi: radio0 2.4 GHz mt7603e, radio1 5 GHz mt7615e, one AP each
+  (`phy0-ap0`, `phy1-ap0`), hostapd objects `hostapd.<ifname>`.
+  `network.wireless status` exposes `up/pending/autostart/disabled` and
+  interfaces; `network.wireless down/up` accept `{"device": "radioN"}`
+  (`/sbin/wifi` does the same plus a `network reload`, which is avoided).
+  Note: `wireless.wifinet1.network='wan lan'` — 5 GHz AP is also attached to
+  the `wan` network; looks unintended, not changed.
+* Hardware watchdog: `/dev/watchdog` fed by procd, `timeout 30`,
+  `magicclose false` — a kernel or procd hang reboots the router. A live test
+  requires a reboot and has not been done.
+* Telegram: `api.telegram.org` resolves to a real IP (not in Podkop's
+  `russia_inside` list) and times out directly from this ISP; through the
+  active VLESS node via `sing-box tools fetch` it answers in ~4 s.
+* Syslog ring is 128 KiB; overlay has 66 MiB free; tmpfs 57 MiB.
+
+Design:
+
+* Classification order: DNSMASQ_DOWN (process missing) > WAN_DOWN >
+  PODKOP_OFF / DNSMASQ_BROKEN (Podkop off: local DNS must still answer) >
+  Podkop classes as before.
+* WAN guard: traffic seen in an outage raises the quiet-check threshold ×3;
+  traffic after a restart that did not help sets `WAN_SUSPECT` (probes, not
+  WAN, are at fault) → threshold ×10 and one notification.
+* Wi-Fi: per-radio state file in tmpfs; faults = down-not-pending,
+  missing hostapd/wpa_supplicant, or tx_packets frozen with clients for
+  `wifi_stall_checks` checks. Manual stops (`autostart=false`) and radios
+  disabled in config are skipped. Backoff 300 s doubling, 1 h cap.
+* Event log: `log` levels notice/warning/err are appended to
+  `/etc/podkop-watchdog/events.log`; rotated to `.1` above 64 KiB. Flash
+  writes are rare (state changes and repairs only).
+* Notifications: queue in tmpfs (30 lines, consecutive duplicates dropped),
+  flushed at most once a minute while the WAN is up, five per flush.
+  Delivery: curl direct (URL via `-K -`, token not in argv) → isolated
+  sing-box through the active node → through LKG. Serialised with candidate
+  tests by the same lock.

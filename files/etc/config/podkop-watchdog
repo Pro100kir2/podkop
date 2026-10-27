@@ -66,6 +66,29 @@ config watchdog 'main'
 	# Received bytes per check above which the WAN counts as "in use".
 	option wan_rx_active_bytes '65536'
 
+	# --- Wi-Fi repair: restart one radio (ubus network.wireless down/up)
+	# when it is enabled but down, lost hostapd, or stopped transmitting
+	# while clients are connected. Radios disabled in config or stopped
+	# with `wifi down` are left alone. Backoff 5 min -> 1 h.
+	option wifi_repair '1'
+	# Checks (2 x check_interval apart) without any transmitted packet,
+	# while clients are connected, before a radio counts as stalled.
+	option wifi_stall_checks '10'
+
+	# --- Event log: notice/warning/error lines in /etc/podkop-watchdog/
+	# events.log (syslog is a RAM ring that sing-box can flood). At most two
+	# files of event_log_max_kb each. Show: podkop-watchdog events
+	option event_log '1'
+	option event_log_max_kb '64'
+
+	# --- Telegram notifications (repairs, outages, recovery). Messages are
+	# queued in RAM and sent when the internet works: directly, or through
+	# the VPN node when Telegram is blocked. Create a bot with @BotFather,
+	# then set both values below and run: podkop-watchdog notify-test
+	option notify '1'
+	option telegram_token ''
+	option telegram_chat_id ''
+
 	# --- Candidate tests (isolated sing-box, live connection untouched)
 	option candidate_test_url 'https://www.cloudflare.com/cdn-cgi/trace'
 	# Fixed string that must appear in the response body.
