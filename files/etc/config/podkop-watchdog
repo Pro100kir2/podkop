@@ -1,0 +1,89 @@
+# podkop-watchdog configuration. Values below are the built-in defaults.
+# After editing: /etc/init.d/podkop-watchdog restart
+
+config watchdog 'main'
+	# 0 disables the service.
+	option enabled '1'
+	# Podkop section whose proxy_string is managed (must be proxy + url mode).
+	option podkop_section 'main'
+
+	# --- Scat API (HTTPS only; certificates are always verified)
+	option api_base 'https://api.scat-search.ru/api'
+	# Query for GET /vless/sub. raw = plain text links; base64 also accepted.
+	option sub_query 'format=raw&rename=false'
+	option api_timeout '20'
+	# Attempts per API step for temporary errors (timeouts, 429, 5xx).
+	option api_retries '3'
+	# First retry delay in seconds; doubles each retry, Retry-After honoured.
+	option api_backoff '15'
+	option scan_poll_interval '15'
+	option scan_wait_max '900'
+	# Seconds between /cache/refresh calls while no node works (minimum 600).
+	option refresh_interval '600'
+	# How often to probe GET /health while healthy.
+	option api_check_interval '600'
+
+	# --- Monitoring
+	option check_interval '30'
+	# Consecutive failed tunnel checks before failover starts.
+	option tunnel_fail_threshold '3'
+	# Consecutive good checks before the tunnel is considered recovered.
+	option tunnel_ok_threshold '2'
+	# Consecutive Podkop plumbing failures before a Podkop reload.
+	option podkop_fail_threshold '3'
+	option wan_interface 'wan'
+	# Direct (non-tunnelled) ICMP targets; any reply = internet up.
+	list internet_target '77.88.8.8'
+	list internet_target '1.1.1.1'
+	list internet_target '8.8.8.8'
+	option dns_test_domain 'google.com'
+	# Resolver for recovery traffic and candidate tests. Empty = Podkop's
+	# bootstrap_dns_server, else 77.88.8.8.
+	option direct_dns ''
+	# Tested through the active outbound via the Clash API.
+	list tunnel_test_url 'https://www.gstatic.com/generate_204'
+	list tunnel_test_url 'https://cp.cloudflare.com/generate_204'
+	option tunnel_test_timeout_ms '8000'
+	# host:port of the sing-box Clash API. Empty = <LAN IP>:9090.
+	option clash_api ''
+	# Also check DNS+nft+tproxy path via ip.podkop.fyi/check (the endpoint
+	# Podkop's LuCI page uses). Report-only: a failure is logged, never acted on.
+	option check_full_path '1'
+	option full_path_url 'https://ip.podkop.fyi/check'
+
+	# --- WAN repair: restart the WAN interface (ubus down/up, like LuCI's
+	# "Restart") when it stays without internet, e.g. PPPoE not coming up
+	# after boot. Never touches a WAN that carries traffic or one stopped
+	# manually with ifdown. 0 disables.
+	option wan_repair '1'
+	# Consecutive failed checks (check_interval apart) before a restart.
+	option wan_fail_threshold '3'
+	# Seconds to let the interface come up after a restart.
+	option wan_settle '60'
+	# Minimum gap between restarts; doubles each time, capped below.
+	option wan_repair_backoff '120'
+	option wan_repair_max_interval '1800'
+	# Received bytes per check above which the WAN counts as "in use".
+	option wan_rx_active_bytes '65536'
+
+	# --- Candidate tests (isolated sing-box, live connection untouched)
+	option candidate_test_url 'https://www.cloudflare.com/cdn-cgi/trace'
+	# Fixed string that must appear in the response body.
+	option candidate_expect 'h=www.cloudflare.com'
+	option candidate_test_timeout '15'
+	# Consecutive successful fetches required.
+	option candidate_test_passes '2'
+	option max_candidates '20'
+	option min_mem_available_kb '8192'
+
+	# --- Switching
+	option max_applies_per_round '3'
+	option settle_time '20'
+	option verify_attempts '4'
+	option verify_interval '15'
+	# Restart budget for Podkop reloads and node switches.
+	option restart_min_interval '60'
+	option restart_max_per_hour '6'
+	option boot_grace '120'
+	# 1 = keep last-known-good on flash (/etc/podkop-watchdog/lkg, 0600).
+	option persist_lkg '1'
