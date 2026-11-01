@@ -54,6 +54,38 @@ build_test_config() { # url outfile
 	return "$_rc"
 }
 
+# Prints a short reason when the failover cannot work with the installed
+# Podkop/sing-box, nothing when it can. Never touches the running Podkop.
+compat_probe() {
+	command -v sing-box >/dev/null 2>&1 || { echo no_singbox; return; }
+	command -v jq >/dev/null 2>&1 || { echo no_jq; return; }
+	_sv=$(sing-box version 2>/dev/null | sed -n 's/^sing-box version \([0-9]*\)\.\([0-9]*\).*/\1 \2/p' | head -n 1)
+	if [ -n "$_sv" ]; then
+		# shellcheck disable=SC2086 # two numbers
+		set -- $_sv
+		if [ "$1" -lt 1 ] || { [ "$1" -eq 1 ] && [ "$2" -lt 12 ]; }; then echo "singbox_$1.$2_lt_1.12"; return; fi
+	fi
+	[ -r "$WD_PODKOP_LIB/sing_box_config_facade.sh" ] || { echo no_podkop_parser; return; }
+	podkop_mode_managed || return 0 # nothing to switch in this mode
+	_cu=$(current_proxy)
+	[ -n "$_cu" ] || return 0
+	_pcfg="$TMP_DIR/compat.json"
+	if build_test_config "$_cu" "$_pcfg"; then
+		rm -f "$_pcfg"
+		return 0
+	fi
+	rm -f "$_pcfg"
+	# The active node itself may be malformed: only a parser that also rejects
+	# the last-known-good node counts as incompatible.
+	_cl=$(lkg_get)
+	if [ -n "$_cl" ] && ! same_node "$_cl" "$_cu" && build_test_config "$_cl" "$_pcfg"; then
+		rm -f "$_pcfg"
+		return 0
+	fi
+	rm -f "$_pcfg"
+	echo podkop_parser_changed
+}
+
 # test_candidate URL -> 0 pass, 1 fail. Sets T_REASON.
 # Never touches the running Podkop instance.
 test_candidate() {
@@ -89,10 +121,28 @@ test_candidate() {
 	[ "$_pass" -ge "$C_CANDIDATE_TEST_PASSES" ]
 }
 
-# fds 8/9 closed: Podkop leaves a background list_update running, which must
-# not hold the watchdog's lock.
+# Reload runs detached and bounded (see svc_run): a hung reload must not freeze
+# WAN/Wi-Fi repair and notifications, and is never killed (it may hold nft).
 podkop_reload() {
-	"$WD_PODKOP_INIT" reload >/dev/null 2>&1 8>&- 9>&-
+	svc_run podkop "$C_SERVICE_TIMEOUT" "$WD_PODKOP_INIT" reload
+	_prc=$?
+	svc_hung podkop "$_prc"
+	return "$_prc"
+}
+
+# One notice per hang; cleared when the action finishes again.
+svc_hung() { # name rc
+	case "$2" in
+	124 | 125)
+		if [ "$S_HUNG_NOTE" != "$1" ]; then
+			log err "$1 action is not finishing (over ${C_SERVICE_TIMEOUT}s); no new one is started until it ends"
+			notify "Команда управления службой $1 зависла. Новые перезапуски отложены, пока она не завершится."
+			S_HUNG_NOTE=$1
+		fi
+		;;
+	*) [ "$S_HUNG_NOTE" = "$1" ] && S_HUNG_NOTE='' ;; # it finished, however it ended
+	esac
+	return 0
 }
 
 podkop_has_staged_changes() {

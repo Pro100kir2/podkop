@@ -199,7 +199,7 @@ Design:
   watchdog itself did the down; unknown interface → inactive.
 * `internet_up` = any ping target OR a direct DNS query, so ICMP filtering
   is not an outage.
-* dnsmasq: `DNSMASQ_DOWN` (process missing while local DNS fails) →
+* dnsmasq: `DNSMASQ_DOWN` (process missing **and** dnsmasq enabled **and** `127.0.0.1` not answering) →
   `/etc/init.d/dnsmasq restart`; `DNS_CHAIN_DOWN` alternates Podkop reload →
   dnsmasq restart. Both use the shared restart budget.
 * `SELFTEST`: before switching nodes, the current node is tested in
@@ -292,3 +292,36 @@ Design:
 * Seen on a service restart: the "stopping" line was missing — procd's
   SIGKILL (5 s after TERM) can land while a tick runs a long probe, so the
   TERM trap never runs. Harmless (state is saved before side effects).
+
+## 8. Hardening pass (2026-11-01)
+
+Findings of an independent architecture review, all fixed and covered by
+`tests/test_hardening.py`:
+
+* dnsmasq is repaired only when enabled by the user and 127.0.0.1 is silent;
+  DNS repair has its own timer and runs in every state (`dns_watch`).
+* Rollback: exponential back-off, one alert; apply/verify/rollback check the
+  user's Podkop intent first.
+* `tunnel_state` is the Clash verdict only. `unknown` (Clash unreachable, tag
+  not found) never triggers failover; the third-party `ip.podkop.fyi` probe is
+  report-only everywhere except as a fallback inside VERIFY.
+* Clash secret header file is no longer deleted between the probe URLs.
+* All `ubus`/`ping`/`nslookup` calls are bounded; service actions go through
+  `svc_run` (detached, never killed, one at a time, hang reported once).
+* Telegram: exponential back-off; the sing-box route at most once per 10 min.
+* WAN auto-detection; an unknown WAN no longer disables monitoring.
+* procd respawn without a retry limit; `run` waits for a stale lock.
+* Boolean options accept 1/yes/on/true/enabled like procd does; probe targets,
+  `clash_api` and `wan_interface` are validated.
+* Escalation: 3 failed Podkop/dnsmasq restarts -> one alert, then slower retries.
+* Compatibility probe (hourly): sing-box >= 1.12 and Podkop's URL parser; on
+  failure only node failover is disabled and the owner is told.
+* Event log de-duplication (5 min) to protect flash; daily heartbeat message.
+* Clash address/secret/tag come from Podkop's generated sing-box config.
+* CLI commands use a private scratch directory (no clash with the daemon).
+* Mesh/ad-hoc/monitor Wi-Fi interfaces are not restarted for lacking hostapd.
+* `selfcheck`, `version`, `.ipk` builder and a release-independent installer.
+
+Not done / open: apk package (the installer works with apk releases), a
+jsonfilter fallback for hosts without jq, contract tests against the real Podkop
+and real OpenWrt rootfs images (needs Docker/QEMU), signed subscriptions.

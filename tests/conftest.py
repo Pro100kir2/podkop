@@ -214,12 +214,15 @@ class Router:
                 "WD_SYS_NET": str(self.base / "sysnet"),
                 "WD_EVENT_LOG": str(self.persist_dir / "events.log"),
                 "WD_HOSTNAME_FILE": str(self.base / "hostname"),
+                "WD_SINGBOX_CONFIG": str(self.base / "singbox.json"),
+                "WD_WATCHDOG_DEV": str(self.base / "watchdog-dev"),
                 "WD_STRICT": "1",
+                "WD_LOCK_WAIT": "0",  # tests that need the real wait set their own
             }
         )
         return env
 
-    def cli(self, *args: str, check: bool = True, timeout: float = 60) -> subprocess.CompletedProcess[str]:
+    def cli(self, *args: str, check: bool = True, timeout: float = 240) -> subprocess.CompletedProcess[str]:
         proc = subprocess.run(
             [SHELL, str(SCRIPT), *args], env=self.env(), capture_output=True, text=True, timeout=timeout
         )

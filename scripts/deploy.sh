@@ -19,6 +19,7 @@ put() { # local_rel remote_path mode
 for m in common checks api candidate machine notify; do
 	put "usr/lib/podkop-watchdog/$m.sh" "/usr/lib/podkop-watchdog/$m.sh" 644
 done
+put usr/lib/podkop-watchdog/VERSION /usr/lib/podkop-watchdog/VERSION 644
 put usr/bin/podkop-watchdog /usr/bin/podkop-watchdog 755
 put etc/init.d/podkop-watchdog /etc/init.d/podkop-watchdog 755
 put lib/upgrade/keep.d/podkop-watchdog /lib/upgrade/keep.d/podkop-watchdog 644
@@ -31,6 +32,7 @@ fi
 
 echo
 echo "Files installed. Next (on the router):"
+echo "  podkop-watchdog selfcheck         # plain-language health report"
 echo "  podkop-watchdog diagnose          # read-only health report"
 echo "  podkop-watchdog test-candidates   # read-only isolated node tests"
 echo "  /etc/init.d/podkop-watchdog enable && /etc/init.d/podkop-watchdog start"
