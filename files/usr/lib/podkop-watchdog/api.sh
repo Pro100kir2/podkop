@@ -12,7 +12,7 @@ api_host() {
 # Resolve via a direct DNS server so recovery never depends on sing-box DNS.
 # Rejects fakeip/loopback/unspecified answers.
 resolve_direct() { # host -> prints IPv4
-	nslookup "$1" "$(direct_dns)" 2>/dev/null | awk '
+	run_with_timeout 5 nslookup "$1" "$(direct_dns)" 2>/dev/null | awk '
 		/^Name:/ {named=1; next}
 		named && /^Address/ {
 			a=$NF; sub(/^.*: */, "", a)

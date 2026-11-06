@@ -15,6 +15,20 @@ event_write() { # level message
 	[ "${C_EVENT_LOG:-1}" = 1 ] || return 0
 	_ef=$WD_EVENT_LOG
 	[ -n "$_ef" ] || return 0
+	# Flash wear: the same message within 5 minutes (a flapping check) is not
+	# written again. The last few messages are remembered in tmpfs.
+	_ek="$WD_STATE_DIR/event.recent"
+	_en=$(now_s)
+	if [ -f "$_ek" ] && EV_MSG="$2" awk -v n="$_en" '
+		{ ts = $1; sub(/^[0-9]+ /, "") }
+		$0 == ENVIRON["EV_MSG"] && n >= ts && n - ts < 300 { f = 1 }
+		END { exit !f }' "$_ek"; then
+		return 0
+	fi
+	if [ -d "$WD_STATE_DIR" ]; then
+		{ tail -n 15 "$_ek" 2>/dev/null; printf '%s %s\n' "$_en" "$2"; } >"$_ek.new" 2>/dev/null &&
+			mv -f "$_ek.new" "$_ek" 2>/dev/null
+	fi
 	[ -d "${_ef%/*}" ] || (umask 077 && mkdir -p "${_ef%/*}") 2>/dev/null || return 0
 	(umask 077 && printf '%s up=%ss %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(now_s)" "$1" "$2" >>"$_ef") 2>/dev/null || return 0
 	_esz=$(wc -c <"$_ef" 2>/dev/null) || return 0
@@ -59,6 +73,12 @@ tg_send() { # text
 	_tr=$(printf 'url = "%s"\n' "$_turl" |
 		curl -s --proto '=https' --tlsv1.2 -m 8 --max-filesize 65536 -K - 2>/dev/null) && tg_ok "$_tr" && return 0
 	[ "$(mem_available_kb)" -ge "$C_MIN_MEM_AVAILABLE_KB" ] || return 1
+	# A sing-box start costs RAM and CPU: at most one round of attempts per 10 min
+	# (the notify-test command ignores the limit).
+	_tvn=$(now_s)
+	if [ "${NOTIFY_FORCE_VIA:-0}" != 1 ] && [ "$S_TG_VIA_AT" -gt "$_tvn" ]; then
+		return 1
+	fi
 	_tcfg="$TMP_DIR/tg.json"
 	_tprev=''
 	for _tnode in "$(current_proxy)" "$(lkg_get)"; do
@@ -66,10 +86,13 @@ tg_send() { # text
 		[ -n "$_tprev" ] && same_node "$_tnode" "$_tprev" && continue
 		_tprev=$_tnode
 		build_test_config "$_tnode" "$_tcfg" || continue
-		_tr=$(run_with_timeout 20 sing-box tools fetch -c "$_tcfg" -D "$TMP_DIR" -o wdtest-out "$_turl" 2>/dev/null)
+		_tr=$(run_with_timeout 15 sing-box tools fetch -c "$_tcfg" -D "$TMP_DIR" -o wdtest-out "$_turl" 2>/dev/null)
 		rm -f "$_tcfg"
 		tg_ok "$_tr" && return 0
 	done
+	# Only a failed round closes the window: while the route works, every
+	# queued message goes out at once.
+	S_TG_VIA_AT=$((_tvn + 600))
 	return 1
 }
 
@@ -95,7 +118,12 @@ notify_flush() {
 		_fmsg=$(head -n 1 "$NOTIFY_QUEUE")
 		if ! tg_send "[$_fname] $_fmsg"; then
 			S_NOTIFY_FAILS=$((S_NOTIFY_FAILS + 1))
-			[ "$S_NOTIFY_FAILS" = 1 ] && log warning "Telegram notification not delivered; will retry every minute"
+			[ "$S_NOTIFY_FAILS" = 1 ] && log warning "Telegram notification not delivered; retrying with growing pauses"
+			# Pause 2, 4, ... 60 min after consecutive failures.
+			_fb=3600
+			[ "$S_NOTIFY_FAILS" -le 5 ] && _fb=$((60 << S_NOTIFY_FAILS))
+			[ "$_fb" -gt 3600 ] && _fb=3600
+			S_NOTIFY_AT=$((_fnow + _fb))
 			break
 		fi
 		[ "$S_NOTIFY_FAILS" -gt 0 ] && log info "Telegram notifications delivered again"

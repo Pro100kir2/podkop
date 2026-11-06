@@ -37,14 +37,27 @@ st_monitor() {
 
 	case "$D_CLASS" in
 	HEALTHY | TUNNEL_UNKNOWN)
-		S_FAIL_N=0 S_PK_FAIL_N=0 S_DNS_ESC=0
+		S_FAIL_N=0 S_PK_FAIL_N=0 S_DNS_ESC=0 S_ESC_N=0
 		S_OK_N=$((S_OK_N + 1))
+		if [ "$D_CLASS" = TUNNEL_UNKNOWN ]; then
+			# Clash silent for several checks in a row (not a one-off blip): tell the
+			# owner, at most every 6 hours.
+			S_UNK_N=$((S_UNK_N + 1))
+			_un=$(now_s)
+			if [ "$S_UNK_N" -ge "$C_TUNNEL_FAIL_THRESHOLD" ] && { [ "$S_UNK_AT" = 0 ] || [ $((_un - S_UNK_AT)) -ge 21600 ]; }; then
+				S_UNK_AT=$_un
+				notify "Не могу проверить VPN: Clash API Podkop недоступен. Автопереключение узлов приостановлено, ремонт роутера продолжается."
+			fi
+		else
+			S_UNK_N=0
+		fi
 		if [ "$D_CLASS" = HEALTHY ] && [ "$S_OK_N" -ge "$C_TUNNEL_OK_THRESHOLD" ] && podkop_mode_managed; then
 			_cur=$(current_proxy)
 			[ -n "$_cur" ] && lkg_set "$_cur"
 		fi
 		;;
 	PODKOP_OFF | WAN_DOWN | DNS_UPSTREAM_DOWN | PATH_DOWN)
+		S_ESC_N=0 S_UNK_N=0
 		# Not fixable by a node switch or Podkop restart (PATH_DOWN depends on
 		# the third-party ip.podkop.fyi service): report only. A dead WAN is
 		# handled separately by wan_watch.
@@ -63,6 +76,26 @@ st_monitor() {
 	esac
 }
 
+# Escalation shared by every "restart something" action: after 3 restarts that
+# did not bring the router back, tell the owner once and slow down (a broken user
+# config cannot be fixed by a reload). Returns 1 while held back.
+esc_gate() { # note-function
+	_now=$(now_s)
+	if [ "$S_ESC_N" -ge 3 ]; then
+		_pause=3600
+		[ "$S_ESC_N" -le 8 ] && _pause=$((C_RESTART_MIN_INTERVAL << (S_ESC_N - 2)))
+		[ "$_pause" -gt 3600 ] && _pause=3600
+		if [ $((_now - S_ESC_AT)) -lt "$_pause" ]; then
+			"$1" escalated warning "router service still unhealthy after $S_ESC_N restarts; retrying less often"
+			return 1
+		fi
+	fi
+	S_ESC_N=$((S_ESC_N + 1))
+	S_ESC_AT=$_now
+	[ "$S_ESC_N" = 3 ] && notify "Сбой не устраняется перезапусками (3 попытки). Нужна проверка роутера вручную; дальше пробую реже."
+	return 0
+}
+
 try_podkop_restart() {
 	_w=$(restart_wait)
 	if [ "$_w" -gt 0 ]; then
@@ -72,18 +105,34 @@ try_podkop_restart() {
 		note_once budget warning "router service unhealthy ($D_CLASS), restart budget exhausted; next allowed in ${_w}s"
 		return
 	fi
-	record_restart
+	_tgt=podkop
 	if [ "$D_CLASS" = DNSMASQ_DOWN ] || [ "$D_CLASS" = DNSMASQ_BROKEN ] ||
 		{ [ "$D_CLASS" = DNS_CHAIN_DOWN ] && [ "$S_DNS_ESC" = 1 ]; }; then
 		# dnsmasq is dead or not answering, or a Podkop reload did not bring local DNS back.
+		_tgt=dnsmasq
+		if ! dnsmasq_managed; then
+			# Disabled on purpose (AdGuard Home, smartdns...): never start it.
+			note_once dnsoff warning "router DNS unhealthy ($D_CLASS) but dnsmasq is disabled by the user; not touching it"
+			S_PK_FAIL_N=0 S_DNS_ESC=0
+			return
+		fi
+	fi
+	if svc_busy "$_tgt"; then
+		# An earlier action is still hanging: do not count a restart that never happened.
+		note_once busy warning "$_tgt action is still running; not starting another"
+		return
+	fi
+	esc_gate note_once || return
+	record_restart
+	if [ "$_tgt" = dnsmasq ]; then
 		log warning "router DNS unhealthy ($D_CLASS) for $S_PK_FAIL_N checks; restarting dnsmasq"
-		notify "DNS роутера не отвечал (у устройств «нет интернета»). Перезапустил dnsmasq."
+		[ "$S_ESC_N" -le 2 ] && notify "DNS роутера не отвечал (у устройств «нет интернета»). Перезапустил dnsmasq."
 		S_PK_FAIL_N=0 S_NOTE='' S_DNS_ESC=0
 		save_state
-		"$WD_DNSMASQ_INIT" restart >/dev/null 2>&1 8>&- 9>&- || log err "dnsmasq restart returned an error"
+		dnsmasq_restart || log err "dnsmasq restart returned an error"
 	else
 		log warning "Podkop unhealthy ($D_CLASS) for $S_PK_FAIL_N checks; reloading Podkop"
-		notify "Podkop работал со сбоем ($D_CLASS). Перезапустил Podkop."
+		[ "$S_ESC_N" -le 2 ] && notify "Podkop работал со сбоем ($D_CLASS). Перезапустил Podkop."
 		S_PK_FAIL_N=0 S_NOTE=''
 		[ "$D_CLASS" = DNS_CHAIN_DOWN ] && S_DNS_ESC=1
 		save_state
@@ -92,11 +141,60 @@ try_podkop_restart() {
 	DELAY=$C_SETTLE_TIME
 }
 
+dnote() { # key level message   -- dns_watch notes, independent of S_NOTE
+	[ "$S_DNS_NOTE" = "$1" ] && return 0
+	log "$2" "$3"
+	S_DNS_NOTE=$1
+}
+
+dnsmasq_restart() {
+	svc_run dnsmasq "$C_SERVICE_TIMEOUT" "$WD_DNSMASQ_INIT" restart
+	_drc=$?
+	svc_hung dnsmasq "$_drc"
+	return "$_drc"
+}
+
+# The router's DNS must be repaired in every state, not only in MONITOR: a node
+# search can last for hours, and every LAN client depends on dnsmasq meanwhile.
+# (MONITOR repairs it through diagnose; this covers the other states.)
+dns_watch() {
+	[ "$S_STATE" = MONITOR ] && return 0
+	_dnow=$(now_s)
+	[ "$S_DNS_AT" -gt "$_dnow" ] && return 0
+	S_DNS_AT=$((_dnow + C_CHECK_INTERVAL))
+	if [ "$(dnsmasq_state)" != 0 ]; then
+		S_DNSM_FAIL_N=0 S_DNS_NOTE=''
+		return 0
+	fi
+	S_DNSM_FAIL_N=$((S_DNSM_FAIL_N + 1))
+	[ "$S_DNSM_FAIL_N" -ge "$C_PODKOP_FAIL_THRESHOLD" ] || return 0
+	_dw=$(restart_wait)
+	if [ "$_dw" -gt 0 ]; then
+		dnote dnsbudget warning "dnsmasq is down during recovery, restart budget exhausted"
+		return 0
+	fi
+	if svc_busy dnsmasq; then
+		dnote busy warning "dnsmasq action is still running; not starting another"
+		return 0
+	fi
+	esc_gate dnote || return 0
+	record_restart
+	S_DNSM_FAIL_N=0
+	log warning "dnsmasq is down while Podkop recovery is running; restarting it"
+	[ "$S_ESC_N" -le 2 ] && notify "DNS роутера не отвечал (у устройств «нет интернета»). Перезапустил dnsmasq."
+	save_state
+	dnsmasq_restart || log err "dnsmasq restart returned an error"
+}
+
 # --------------------------------------------------------------- recovery ---
 
 start_recovery() {
 	if ! podkop_mode_managed; then
 		note_once unmanaged warning "active node down, but podkop.$C_SEC is not connection_type=proxy + proxy_config_type=url; not switching"
+		return
+	fi
+	if [ "$S_COMPAT" = 0 ]; then
+		note_once compat warning "active node down, but node failover is disabled (incompatible Podkop/sing-box: $S_COMPAT_WHY)"
 		return
 	fi
 	_cur=$(current_proxy)
@@ -140,21 +238,33 @@ st_selftest() {
 		begin_search
 		return
 	fi
-	exec 8>"$WD_LOCK_FILE.test"
-	if ! flock -n 8; then
+	if [ "$S_PHASE" != self_ok ]; then
+		exec 8>"$WD_LOCK_FILE.test"
+		if ! flock -n 8; then
+			exec 8>&-
+			DELAY=$C_CHECK_INTERVAL
+			return
+		fi
+		if ! test_candidate "$_cur"; then
+			exec 8>&-
+			log info "active node id=$(node_id "$_cur") also fails in isolation ($T_REASON); looking for another node"
+			begin_search
+			return
+		fi
 		exec 8>&-
+		S_PHASE=self_ok # tested once; from now on only wait for the budget
+	fi
+	_w=$(restart_wait)
+	if [ "$_w" -gt 0 ]; then
+		# The node works: wait for the restart budget rather than switch it.
+		note_once budget warning "active node works in isolation; Podkop reload postponed by restart budget for ${_w}s"
+		[ "$_w" -gt 300 ] && _w=300
+		DELAY=$_w
+		return
+	fi
+	if svc_busy podkop; then
+		note_once busy warning "an earlier Podkop action is still running; reload postponed"
 		DELAY=$C_CHECK_INTERVAL
-		return
-	fi
-	if ! test_candidate "$_cur"; then
-		exec 8>&-
-		log info "active node id=$(node_id "$_cur") also fails in isolation ($T_REASON); looking for another node"
-		begin_search
-		return
-	fi
-	exec 8>&-
-	if [ "$(restart_wait)" -gt 0 ]; then
-		begin_search
 		return
 	fi
 	log warning "active node id=$(node_id "$_cur") works in isolation; reloading Podkop instead of switching"
@@ -169,7 +279,7 @@ st_selftest() {
 
 end_recovery() {
 	rm -f "$CAND_FILE" "$ROLLBACK_FILE"
-	S_PHASE='' S_CAND_IDX=0 S_APPLIES=0 S_FAILED_IDS='' S_FAIL_N=0 S_VERIFY_N=0 S_NOTE='' S_APPLIED_ID=''
+	S_PHASE='' S_CAND_IDX=0 S_APPLIES=0 S_FAILED_IDS='' S_FAIL_N=0 S_VERIFY_N=0 S_NOTE='' S_APPLIED_ID='' S_RB_FAIL_N=0 S_DNSM_FAIL_N=0
 	S_NO_NODE_AT=0
 	set_state MONITOR
 }
@@ -192,9 +302,7 @@ recovery_guard() {
 		return 1
 	fi
 	[ "$S_NOTE" = wan ] && { log notice "WAN reachable again; recovery resumed"; S_NOTE=''; }
-	_dl=0
-	dns_ok 127.0.0.1 && _dl=1
-	if [ "$(tunnel_state "$_dl")" = ok ]; then
+	if [ "$(tunnel_state)" = ok ]; then
 		S_OK_N=$((S_OK_N + 1))
 		if [ "$S_OK_N" -ge "$C_TUNNEL_OK_THRESHOLD" ]; then
 			log notice "active node is working again; recovery cancelled"
@@ -351,9 +459,20 @@ st_apply() {
 		DELAY=1
 		return
 	fi
+	if ! podkop_intent_on; then
+		log notice "Podkop was stopped or disabled by the user; recovery cancelled"
+		end_recovery
+		DELAY=$C_CHECK_INTERVAL
+		return
+	fi
 	if ! podkop_mode_managed; then
 		log warning "podkop.$C_SEC is no longer in url mode; recovery cancelled"
 		end_recovery
+		return
+	fi
+	if svc_busy podkop; then
+		note_once busy warning "an earlier Podkop action is still running; switch postponed"
+		DELAY=$C_CHECK_INTERVAL
 		return
 	fi
 	if podkop_has_staged_changes; then
@@ -399,6 +518,12 @@ st_apply() {
 }
 
 st_verify() {
+	if ! podkop_intent_on; then
+		log notice "Podkop was stopped or disabled by the user; verification cancelled"
+		end_recovery
+		DELAY=$C_CHECK_INTERVAL
+		return
+	fi
 	if ! wan_ok; then
 		note_once wan warning "verification paused: WAN/internet unreachable"
 		DELAY=$C_CHECK_INTERVAL
@@ -435,6 +560,18 @@ st_verify() {
 }
 
 st_rollback() {
+	if ! podkop_intent_on; then
+		log notice "Podkop was stopped or disabled by the user; rollback skipped"
+		end_recovery
+		DELAY=$C_CHECK_INTERVAL
+		return
+	fi
+	if svc_busy podkop; then
+		# Not a failed rollback: the earlier reload is still reading the configuration.
+		note_once busy warning "an earlier Podkop action is still running; rollback waits"
+		DELAY=$C_CHECK_INTERVAL
+		return
+	fi
 	if [ ! -f "$ROLLBACK_FILE" ]; then
 		log err "no rollback copy available; keeping current configuration"
 	else
@@ -443,9 +580,24 @@ st_rollback() {
 		save_state
 		if podkop_set_proxy "$(cat "$ROLLBACK_FILE")"; then
 			log notice "rolled back to the previous configuration"
+			S_RB_FAIL_N=0
 		else
-			log err "rollback failed; retrying in ${C_RESTART_MIN_INTERVAL}s"
-			DELAY=$C_RESTART_MIN_INTERVAL
+			# Exponential pause (60, 120, ... 1800 s): a reload that keeps failing
+			# must not run once a minute forever.
+			S_RB_FAIL_N=$((S_RB_FAIL_N + 1))
+			_d=1800
+			[ "$S_RB_FAIL_N" -le 5 ] && _d=$((C_RESTART_MIN_INTERVAL << (S_RB_FAIL_N - 1)))
+			[ "$_d" -gt 1800 ] && _d=1800
+			log err "rollback failed (attempt $S_RB_FAIL_N); retrying in ${_d}s"
+			if [ "$S_RB_FAIL_N" -ge 8 ]; then
+				log err "rollback failed $S_RB_FAIL_N times; giving up and returning to monitoring"
+				notify "Не удалось вернуть прежние настройки Podkop за 8 попыток. Слежу дальше в обычном режиме; нужна проверка вручную."
+				end_recovery
+				DELAY=$C_CHECK_INTERVAL
+				return
+			fi
+			[ "$S_RB_FAIL_N" = 3 ] && notify "Не удаётся вернуть прежние настройки Podkop (3 попытки). Нужно проверить роутер вручную; продолжаю пробовать с паузой."
+			DELAY=$_d
 			return
 		fi
 	fi
@@ -556,9 +708,9 @@ wnote() { # key level message   -- WAN notes, independent of S_NOTE
 }
 
 wan_restart() {
-	ubus call "network.interface.$C_WAN_INTERFACE" down >/dev/null 2>&1 8>&- 9>&-
-	ubus call "network.interface.$C_WAN_INTERFACE" up >/dev/null 2>&1 8>&- 9>&- ||
-		ubus call "network.interface.$C_WAN_INTERFACE" up >/dev/null 2>&1 8>&- 9>&-
+	ubus_t call "network.interface.$WAN_IF" down >/dev/null 2>&1 8>&- 9>&-
+	ubus_t call "network.interface.$WAN_IF" up >/dev/null 2>&1 8>&- 9>&- ||
+		ubus_t call "network.interface.$WAN_IF" up >/dev/null 2>&1 8>&- 9>&-
 }
 
 # Restarts the WAN interface when it stays without internet (for example a
@@ -570,12 +722,15 @@ wan_watch() {
 	_wnow=$(now_s)
 	[ "$S_WAN_AT" -gt "$_wnow" ] && return 0
 	S_WAN_AT=$((_wnow + C_CHECK_INTERVAL))
+	wan_resolve
 	if ! wan_status; then
-		wnote noif err "WAN interface '$C_WAN_INTERFACE' not found; WAN repair inactive"
+		wnote noif err "WAN interface '${WAN_IF:-auto}' not found; WAN repair inactive (connectivity is judged by probes only)"
 		return 0
 	fi
 	W_INET=0
-	[ "$W_LINK" = 1 ] && internet_up && W_INET=1
+	if [ "$W_LINK" = 1 ] || [ -z "$C_WAN_INTERFACE" ]; then
+		internet_up && W_INET=1 # (auto-detected interface: the link may be the wrong one)
+	fi
 	W_CHECKED=1
 	_delta=0
 	if _rx=$(wan_rx_bytes "$W_L3"); then
@@ -598,7 +753,7 @@ wan_watch() {
 	fi
 	[ "$S_WAN_DOWN_AT" = 0 ] && S_WAN_DOWN_AT=$_wnow
 	if [ "$W_AUTO" = 0 ] && [ "$S_WAN_FIXES" = 0 ]; then
-		wnote manual notice "WAN interface '$C_WAN_INTERFACE' was stopped manually; not restarting it"
+		wnote manual notice "WAN interface '$WAN_IF' was stopped manually; not restarting it"
 		S_WAN_FAIL_N=0
 		return 0
 	fi
@@ -622,6 +777,16 @@ wan_watch() {
 	[ "$S_WAN_TRAFFIC" = 1 ] && _thr=$((C_WAN_FAIL_THRESHOLD * 3))
 	[ "$S_WAN_SUSPECT" = 1 ] && _thr=$((C_WAN_FAIL_THRESHOLD * 10))
 	[ "$S_WAN_FAIL_N" -lt "$_thr" ] && return 0
+	if [ -z "$C_WAN_INTERFACE" ]; then
+		# The remembered interface may no longer be the one carrying traffic
+		# (backup link took over, then the main one came back).
+		_walt=$(wan_detect_active)
+		if [ -n "$_walt" ] && [ "$_walt" != "$WAN_IF" ]; then
+			log notice "WAN interface changed: $WAN_IF -> $_walt"
+			S_WAN_IF=$_walt WAN_IF=$_walt S_WAN_FAIL_N=0
+			return 0
+		fi
+	fi
 	if [ "$S_WAN_REPAIR_AT" -gt "$_wnow" ]; then
 		wnote wait info "WAN still down; next interface restart in $((S_WAN_REPAIR_AT - _wnow))s"
 		return 0
@@ -630,7 +795,7 @@ wan_watch() {
 	_b=$C_WAN_REPAIR_MAX_INTERVAL
 	[ "$S_WAN_FIXES" -le 12 ] && _b=$((C_WAN_REPAIR_BACKOFF << (S_WAN_FIXES - 1)))
 	[ "$_b" -gt "$C_WAN_REPAIR_MAX_INTERVAL" ] && _b=$C_WAN_REPAIR_MAX_INTERVAL
-	log warning "WAN without internet for $S_WAN_FAIL_N checks (link=$W_LINK); restarting interface '$C_WAN_INTERFACE' (attempt $S_WAN_FIXES)"
+	log warning "WAN without internet for $S_WAN_FAIL_N checks (link=$W_LINK); restarting interface '$WAN_IF' (attempt $S_WAN_FIXES)"
 	case "$S_WAN_FIXES" in
 	1) notify "Нет интернета ~$(((_wnow - S_WAN_DOWN_AT) / 60)) мин. Перезапускаю WAN." ;;
 	3) notify "Перезапуски WAN не помогают (3 попытки). Вероятно, проблема у провайдера или с кабелем. Продолжаю пробовать каждые до 30 мин." ;;
@@ -650,9 +815,9 @@ WIFI_STATE="$WD_STATE_DIR/wifi"
 
 wifi_restart() { # radio
 	_wj="{\"device\":\"$1\"}"
-	ubus call network.wireless down "$_wj" >/dev/null 2>&1 8>&- 9>&-
-	ubus call network.wireless up "$_wj" >/dev/null 2>&1 8>&- 9>&- ||
-		ubus call network.wireless up "$_wj" >/dev/null 2>&1 8>&- 9>&-
+	ubus_t call network.wireless down "$_wj" >/dev/null 2>&1 8>&- 9>&-
+	ubus_t call network.wireless up "$_wj" >/dev/null 2>&1 8>&- 9>&- ||
+		ubus_t call network.wireless up "$_wj" >/dev/null 2>&1 8>&- 9>&-
 }
 
 # Restarts a single radio that is enabled in config but down, lost its
@@ -728,6 +893,44 @@ EOF2
 	return 0
 }
 
+# Podkop's internals are not a public contract: check hourly (and after a
+# restart) that the parts the failover depends on still behave as expected. If
+# not, node switching is disabled (router repair goes on) and the owner is told.
+compat_watch() {
+	_cn=$(now_s)
+	[ "$S_COMPAT_AT" -gt 0 ] && [ $((_cn - S_COMPAT_AT)) -lt 3600 ] && [ "$_cn" -ge "$S_COMPAT_AT" ] && return 0
+	S_COMPAT_AT=$_cn
+	[ "$S_STATE" = MONITOR ] || return 0 # never test while a recovery owns the sing-box test slot
+	_why=$(compat_probe)
+	if [ -z "$_why" ]; then
+		if [ "$S_COMPAT" = 0 ]; then
+			log notice "Podkop compatibility restored; node failover enabled"
+			notify "Совместимость с Podkop восстановлена: автопереключение узлов снова включено."
+		fi
+		S_COMPAT=1 S_COMPAT_WHY=''
+	else
+		if [ "$S_COMPAT" = 1 ] || [ "$S_COMPAT_WHY" != "$_why" ]; then
+			log err "Podkop compatibility check failed ($_why); node failover disabled, router repair continues"
+			notify "Podkop или sing-box изменились ($_why): автопереключение узлов отключено, ремонт роутера продолжается."
+		fi
+		S_COMPAT=0 S_COMPAT_WHY=$_why
+	fi
+}
+
+# Once a day: proof of life for an owner who has no other way to notice that the
+# watchdog itself stopped.
+heartbeat() {
+	[ "$C_HEARTBEAT" = 1 ] || return 0
+	notify_enabled || return 0
+	_hn=$(now_s)
+	[ "$S_HB_AT" -gt 0 ] && [ $((_hn - S_HB_AT)) -lt 86400 ] && [ "$_hn" -ge "$S_HB_AT" ] && return 0
+	_first=0
+	[ "$S_HB_AT" = 0 ] && _first=1
+	S_HB_AT=$_hn
+	[ "$_first" = 1 ] && return 0 # the first one is due a day after the start
+	notify "Ежедневная сводка: watchdog работает. Состояние: ${S_LAST_CLASS:-?}, аптайм $((_hn / 3600)) ч, свободно RAM $(($(mem_available_kb) / 1024)) МБ."
+}
+
 tick() {
 	load_state
 	_tnow=$(now_s)
@@ -745,7 +948,8 @@ tick() {
 		DELAY=$((S_NEXT_AT - _tnow))
 		return
 	fi
-	W_CHECKED=0
+	W_CHECKED=0 W_TRIED=0
+	wan_resolve
 	if wan_watch; then
 		if [ "$S_DUE_AT" -le "$_tnow" ]; then
 			case "$S_STATE" in
@@ -772,13 +976,17 @@ tick() {
 	elif [ "$S_DUE_AT" -lt "$S_WAN_AT" ]; then
 		S_DUE_AT=$S_WAN_AT # let the WAN settle before the next recovery step
 	fi
+	dns_watch
 	wifi_watch
+	compat_watch
+	heartbeat
 	notify_flush
 	# Wake for whichever comes first: the next state step or the next WAN check.
 	_tnow=$(now_s)
 	_wake=$S_DUE_AT
 	[ "$C_WAN_REPAIR" = 1 ] && [ "$S_WAN_AT" -lt "$_wake" ] && _wake=$S_WAN_AT
 	[ "$C_WIFI_REPAIR" = 1 ] && [ "$S_WIFI_AT" -lt "$_wake" ] && _wake=$S_WIFI_AT
+	[ "$S_STATE" != MONITOR ] && [ "$S_DNS_AT" -lt "$_wake" ] && _wake=$S_DNS_AT
 	[ "$_wake" -le "$_tnow" ] && _wake=$((_tnow + 1))
 	S_NEXT_AT=$_wake
 	DELAY=$((_wake - _tnow))

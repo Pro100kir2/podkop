@@ -344,13 +344,22 @@ def test_procd_init_script() -> None:
     init = (FILES / "etc/init.d/podkop-watchdog").read_text()
     assert "USE_PROCD=1" in init
     assert 'procd_set_param command "$PROG" run' in init
-    assert "procd_set_param respawn 3600 30 5" in init
+    assert "procd_set_param respawn 3600 30 0" in init
     assert "procd_add_reload_trigger podkop-watchdog" in init
     # S99podkop-watchdog sorts after S99podkop: starts after Podkop at boot.
     assert "START=99" in init and sorted(["S99podkop-watchdog", "S99podkop"])[0] == "S99podkop"
     assert subprocess.run([SHELL, "-n", str(FILES / "etc/init.d/podkop-watchdog")]).returncode == 0
     keep = (FILES / "lib/upgrade/keep.d/podkop-watchdog").read_text()
-    assert keep.strip() == "/etc/podkop-watchdog/"
+    # The program itself survives sysupgrade too, not just its state (a router
+    # without a specialist must not silently lose its watchdog after an upgrade).
+    assert keep.split() == [
+        "/etc/podkop-watchdog/",
+        "/usr/lib/podkop-watchdog/",
+        "/usr/bin/podkop-watchdog",
+        "/etc/init.d/podkop-watchdog",
+        "/etc/rc.d/S99podkop-watchdog",
+        "/etc/rc.d/K05podkop-watchdog",
+    ]
 
 
 def test_status_and_diagnose_commands_do_not_leak(router: Router) -> None:

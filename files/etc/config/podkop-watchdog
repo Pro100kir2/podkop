@@ -31,7 +31,9 @@ config watchdog 'main'
 	option tunnel_ok_threshold '2'
 	# Consecutive Podkop plumbing failures before a Podkop reload.
 	option podkop_fail_threshold '3'
-	option wan_interface 'wan'
+	# Empty = auto-detect (default-route interface, else 'wan', else a PPPoE/DHCP/
+	# modem interface). Set it only if detection picks the wrong one.
+	option wan_interface ''
 	# Direct (non-tunnelled) ICMP targets; any reply = internet up.
 	list internet_target '77.88.8.8'
 	list internet_target '1.1.1.1'
@@ -86,6 +88,11 @@ config watchdog 'main'
 	# the VPN node when Telegram is blocked. Create a bot with @BotFather,
 	# then set both values below and run: podkop-watchdog notify-test
 	option notify '1'
+	# Once a day: a short "watchdog is alive" message (needs Telegram).
+	option heartbeat '1'
+	# Seconds a service action (Podkop reload, dnsmasq restart) may run before
+	# it is reported as hung (it is never killed).
+	option service_timeout '180'
 	option telegram_token ''
 	option telegram_chat_id ''
 

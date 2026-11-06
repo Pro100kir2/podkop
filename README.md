@@ -19,11 +19,45 @@ is stopped.
 * Built and verified against OpenWrt 24.10.5 / Podkop v0.7.14 / sing-box 1.12.17
   (see [docs/DESIGN.md](docs/DESIGN.md) for the reconnaissance and contracts).
 
+## Hardening rules (what the service guarantees)
+
+* **Never fights the owner.** A disabled dnsmasq stays disabled; a Podkop the
+  user stopped is not restarted (also not by a rollback in the middle of a
+  switch); unknown Clash state never causes a node switch.
+* **Router DNS is repaired in every state**, also during a multi-hour node search.
+* **Nothing can freeze the daemon.** Every `ubus`, `ping` and `nslookup` call is
+  time-bounded; `podkop reload` / `dnsmasq restart` run detached
+  (`service_timeout`, default 180 s). A hung one is reported once, never killed,
+  and no second one is started until it ends.
+* **No loops.** A failing rollback backs off 60 s → 30 min and alerts once;
+  repeated failures to heal Podkop alert once after 3 attempts and then slow down;
+  Telegram retries back off from 2 min to 1 h and the VPN route for Telegram is
+  tried at most once per 10 min.
+* **Works on any WAN name.** `wan_interface` empty (default) = auto-detect
+  (default-route interface, else `wan`, else a PPPoE/DHCP/modem interface). If no
+  WAN is found, connectivity is judged by probes and monitoring stays on.
+* **Survives Podkop updates.** Clash address, secret and outbound tag are read
+  from Podkop's generated sing-box config; an hourly compatibility check
+  (sing-box ≥ 1.12, Podkop URL parser still works) disables only the node
+  failover, tells the owner, and keeps repairing the router.
+* **Proof of life.** With Telegram configured, a daily summary message arrives;
+  if it stops arriving, the watchdog (or the router) is down.
+* **Gentle on flash.** The event log drops the same message repeated within
+  5 minutes.
+* procd never gives up respawning (`respawn 3600 30 0`); a restarted instance
+  waits up to 60 s for the previous lock holder instead of failing.
+* Survives `sysupgrade`: the program, its init script and the boot links are in
+  `/lib/upgrade/keep.d`, not just the state.
+* Needs jq >= 1.6 (OpenWrt 21.02+; Podkop itself needs 23.05+). Filters avoid
+  regex functions, which the default jq package is built without.
+* `podkop-watchdog selfcheck` prints a plain-language health report;
+  `version` prints the installed version.
+
 ## Layout
 
 ```
 files/                              -> copied to / on the router
-  usr/bin/podkop-watchdog           CLI: run | tick | status | diagnose | test-candidates | events | notify-test
+  usr/bin/podkop-watchdog           CLI: run | tick | status | diagnose | selfcheck | version | test-candidates | events | notify-test
   usr/lib/podkop-watchdog/
     common.sh                       config, state file, clock, locks, restart budget
     checks.sh                       read-only diagnostics and classification
@@ -34,7 +68,7 @@ files/                              -> copied to / on the router
   etc/init.d/podkop-watchdog        procd init script
   etc/config/podkop-watchdog        UCI config, every option documented
   lib/upgrade/keep.d/podkop-watchdog  keeps the LKG across sysupgrade
-scripts/deploy.sh, scripts/uninstall.sh
+scripts/deploy.sh (SSH), scripts/build_ipk.py + scripts/install.sh (package), scripts/uninstall.sh
 tests/                              pytest suite (runs the real shell code)
 docs/DESIGN.md                      recon results, contracts, design, assumptions
 ```
@@ -45,7 +79,7 @@ Every `check_interval` (30 s) the service classifies the router:
 
 | Class | Meaning | Action |
 |---|---|---|
-| `DNSMASQ_DOWN` | the router's DNS server (dnsmasq, used by every LAN client) is not running — checked first, with or without WAN or Podkop | `dnsmasq restart` after 3 checks, budgeted |
+| `DNSMASQ_DOWN` | dnsmasq is **enabled**, its process is gone **and** `127.0.0.1` does not answer — checked first, with or without WAN or Podkop. A dnsmasq the user disabled (AdGuard Home, smartdns) is never started | `dnsmasq restart` after 3 checks, budgeted |
 | `PODKOP_OFF` | Podkop disabled or stopped on purpose (`shutdown_correctly=1`), router DNS answers | none |
 | `DNSMASQ_BROKEN` | Podkop off, dnsmasq running but not answering while direct DNS works | `dnsmasq restart`, budgeted |
 | `WAN_DOWN` | WAN link down, or neither ping targets nor a direct DNS query answer | no VPN action; the WAN repair below restarts the interface |
@@ -142,6 +176,21 @@ MONITOR ──TUNNEL_DOWN ×3──▶ SELFTEST: current node works in isolation
   needed), and the next-run time survives respawns (no request bursts).
 
 ## Install
+
+**Package (recommended).** Build once on your computer, copy to the router:
+
+```sh
+python3 scripts/build_ipk.py                      # -> dist/podkop-watchdog_<ver>_all.ipk
+scp dist/*.ipk scripts/install.sh root@192.168.1.1:/tmp/
+ssh root@192.168.1.1 'sh /tmp/install.sh /tmp/podkop-watchdog_*_all.ipk'   # any release
+# or, on OpenWrt <= 24.10 only:  opkg install /tmp/podkop-watchdog_*_all.ipk
+```
+
+`install.sh <file.ipk>` also works on apk-based releases (25.x): it only uses
+the package as an archive, keeps an existing `/etc/config/podkop-watchdog`,
+enables and starts the service and prints the `selfcheck` report.
+
+**Manual (SSH, files only):**
 
 From the development machine (files only; nothing is enabled):
 

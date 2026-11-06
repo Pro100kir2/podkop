@@ -14,11 +14,14 @@
 : "${WD_SYS_NET:=/sys/class/net}"
 : "${WD_EVENT_LOG:=$WD_PERSIST_DIR/events.log}"
 : "${WD_HOSTNAME_FILE:=/proc/sys/kernel/hostname}"
+: "${WD_SINGBOX_CONFIG:=/etc/sing-box/config.json}"
+: "${WD_WATCHDOG_DEV:=/dev/watchdog}"
 
 STATE_FILE="$WD_STATE_DIR/state"
 CAND_FILE="$WD_STATE_DIR/candidates"
 ROLLBACK_FILE="$WD_STATE_DIR/rollback"
 TMP_DIR="$WD_STATE_DIR/tmp"
+WAN_IF='' W_UNKNOWN=0 W_TRIED=0 W_GUESS=''
 
 # Mark used by Podkop's own sing-box traffic; nft mangle_output returns early for it.
 PODKOP_OUTBOUND_MARK=2097152 # 0x00200000
@@ -68,7 +71,7 @@ cfg_defaults() {
 	C_TUNNEL_FAIL_THRESHOLD=3
 	C_TUNNEL_OK_THRESHOLD=2
 	C_PODKOP_FAIL_THRESHOLD=3
-	C_WAN_INTERFACE=wan
+	C_WAN_INTERFACE=''
 	C_INTERNET_TARGET='77.88.8.8 1.1.1.1 8.8.8.8'
 	C_DNS_TEST_DOMAIN=google.com
 	C_DIRECT_DNS=''
@@ -106,6 +109,8 @@ cfg_defaults() {
 	C_WAN_RX_ACTIVE_BYTES=65536
 	C_WIFI_REPAIR=1
 	C_WIFI_STALL_CHECKS=10
+	C_SERVICE_TIMEOUT=180
+	C_HEARTBEAT=1
 	C_EVENT_LOG=1
 	C_EVENT_LOG_MAX_KB=64
 	C_NOTIFY=1
@@ -139,10 +144,24 @@ cfg_assign() { # name value
 	wan_settle) C_WAN_SETTLE=$2 ;; wan_repair_backoff) C_WAN_REPAIR_BACKOFF=$2 ;;
 	wan_repair_max_interval) C_WAN_REPAIR_MAX_INTERVAL=$2 ;; wan_rx_active_bytes) C_WAN_RX_ACTIVE_BYTES=$2 ;;
 	wifi_repair) C_WIFI_REPAIR=$2 ;; wifi_stall_checks) C_WIFI_STALL_CHECKS=$2 ;;
-	event_log) C_EVENT_LOG=$2 ;; event_log_max_kb) C_EVENT_LOG_MAX_KB=$2 ;;
+	service_timeout) C_SERVICE_TIMEOUT=$2 ;; heartbeat) C_HEARTBEAT=$2 ;; event_log) C_EVENT_LOG=$2 ;; event_log_max_kb) C_EVENT_LOG_MAX_KB=$2 ;;
 	notify) C_NOTIFY=$2 ;; telegram_token) C_TG_TOKEN=$2 ;; telegram_chat_id) C_TG_CHAT=$2 ;;
 	*) log warning "unknown config option '$1' ignored" ;;
 	esac
+}
+
+# Normalise a boolean option the way procd's config_get_bool reads it.
+cfg_bool() { # varname default
+	eval "_v=\${$1}"
+	case "$_v" in
+	1 | yes | on | true | enabled) _v=1 ;;
+	0 | no | off | false | disabled) _v=0 ;;
+	*)
+		[ -n "$_v" ] && log warning "invalid boolean for ${1#C_}, using $2"
+		_v=$2
+		;;
+	esac
+	eval "$1=\$_v"
 }
 
 # Clamp an integer config variable into [min,max]; fall back to default if invalid.
@@ -204,6 +223,34 @@ EOF
 	cfg_int C_WAN_RX_ACTIVE_BYTES 65536 1024 1073741824
 	cfg_int C_WIFI_STALL_CHECKS 10 3 1000
 	cfg_int C_EVENT_LOG_MAX_KB 64 8 1024
+	cfg_int C_SERVICE_TIMEOUT 180 10 900
+	# procd's config_get_bool accepts 1/yes/on/true/enabled: the daemon must agree.
+	cfg_bool C_ENABLED 1
+	cfg_bool C_CHECK_FULL_PATH 1
+	cfg_bool C_PERSIST_LKG 1
+	cfg_bool C_WAN_REPAIR 1
+	cfg_bool C_WIFI_REPAIR 1
+	cfg_bool C_EVENT_LOG 1
+	cfg_bool C_NOTIFY 1
+	cfg_bool C_HEARTBEAT 1
+	# (case, not grep: BusyBox grep finds no match in an empty string)
+	case "$C_WAN_INTERFACE" in
+	*[!A-Za-z0-9_.-]*)
+		log err "wan_interface is malformed, using auto-detection"
+		C_WAN_INTERFACE=''
+		;;
+	esac
+	for _t in $C_INTERNET_TARGET; do
+		is_ipv4 "$_t" || {
+			log err "internet_target '$_t' is not an IPv4 address, using defaults"
+			C_INTERNET_TARGET='77.88.8.8 1.1.1.1 8.8.8.8'
+			break
+		}
+	done
+	if [ -n "$C_CLASH_API" ] && ! printf '%s' "$C_CLASH_API" | grep -Eq '^[A-Za-z0-9.-]+:[0-9]{1,5}$'; then
+		log err "clash_api must be host:port, using auto-detection"
+		C_CLASH_API=''
+	fi
 	# The token ends up in a URL: accept only the documented formats (never log it).
 	if [ -n "$C_TG_TOKEN" ] && ! printf '%s' "$C_TG_TOKEN" | grep -Eq '^[0-9]{1,20}:[A-Za-z0-9_-]{20,100}$'; then
 		log err "telegram_token has an invalid format; notifications disabled"
@@ -244,7 +291,8 @@ state_defaults() {
 	S_APPLIED_ID='' S_D_SUMMARY='' S_DUE_AT=0 S_SELF_AT=0 S_DNS_ESC=0
 	S_WAN_AT=0 S_WAN_FAIL_N=0 S_WAN_FIXES=0 S_WAN_REPAIR_AT=0 S_WAN_RX='' S_WAN_NOTE=''
 	S_WAN_TRAFFIC=0 S_WAN_SUSPECT=0 S_WAN_DOWN_AT=0 S_WIFI_AT=0 S_NOTIFY_AT=0 S_NOTIFY_FAILS=0
-	S_NO_NODE_AT=0
+	S_NO_NODE_AT=0 S_DNS_AT=0 S_DNSM_FAIL_N=0 S_RB_FAIL_N=0 S_WAN_IF='' S_TG_VIA_AT=0
+	S_HUNG_NOTE='' S_ESC_N=0 S_ESC_AT=0 S_HB_AT=0 S_COMPAT=1 S_COMPAT_AT=0 S_COMPAT_WHY='' S_UNK_N=0 S_UNK_AT=0 S_DNS_NOTE=''
 }
 
 # Known keys only; values are plain tokens written by save_state.
@@ -268,18 +316,24 @@ load_state() {
 		WAN_REPAIR_AT) S_WAN_REPAIR_AT=$_v ;; WAN_RX) S_WAN_RX=$_v ;; WAN_NOTE) S_WAN_NOTE=$_v ;;
 		WAN_TRAFFIC) S_WAN_TRAFFIC=$_v ;; WAN_SUSPECT) S_WAN_SUSPECT=$_v ;; WAN_DOWN_AT) S_WAN_DOWN_AT=$_v ;;
 		WIFI_AT) S_WIFI_AT=$_v ;; NOTIFY_AT) S_NOTIFY_AT=$_v ;; NOTIFY_FAILS) S_NOTIFY_FAILS=$_v ;;
-		NO_NODE_AT) S_NO_NODE_AT=$_v ;;
+		NO_NODE_AT) S_NO_NODE_AT=$_v ;; DNS_AT) S_DNS_AT=$_v ;; DNSM_FAIL_N) S_DNSM_FAIL_N=$_v ;;
+		RB_FAIL_N) S_RB_FAIL_N=$_v ;; WAN_IF) S_WAN_IF=$_v ;; TG_VIA_AT) S_TG_VIA_AT=$_v ;;
+		HUNG_NOTE) S_HUNG_NOTE=$_v ;; ESC_N) S_ESC_N=$_v ;; ESC_AT) S_ESC_AT=$_v ;; HB_AT) S_HB_AT=$_v ;;
+		DNS_NOTE) S_DNS_NOTE=$_v ;; UNK_N) S_UNK_N=$_v ;; UNK_AT) S_UNK_AT=$_v ;; COMPAT) S_COMPAT=$_v ;; COMPAT_AT) S_COMPAT_AT=$_v ;; COMPAT_WHY) S_COMPAT_WHY=$_v ;;
 		esac
 	done <"$STATE_FILE"
 	for _n in NEXT_AT FAIL_N OK_N PK_FAIL_N ATTEMPT CAND_IDX APPLIES VERIFY_N DEADLINE \
 		LAST_API_AT REC_STARTED CYCLE LAST_QCHECK DUE_AT SELF_AT DNS_ESC WAN_AT WAN_FAIL_N \
 		WAN_FIXES WAN_REPAIR_AT WAN_TRAFFIC WAN_SUSPECT WAN_DOWN_AT WIFI_AT NOTIFY_AT NOTIFY_FAILS \
-		NO_NODE_AT; do
+		NO_NODE_AT DNS_AT DNSM_FAIL_N RB_FAIL_N TG_VIA_AT ESC_N ESC_AT HB_AT COMPAT_AT UNK_N UNK_AT; do
 		eval "_v=\$S_$_n"
 		is_uint "$_v" || eval "S_$_n=0"
 	done
 	is_uint "$S_LAST_REFRESH_AT" || S_LAST_REFRESH_AT=''
+	[ "$S_COMPAT" = 0 ] || S_COMPAT=1
+	case "$S_COMPAT_WHY" in *[!A-Za-z0-9_.-]*) S_COMPAT_WHY='' ;; esac
 	is_uint "$S_WAN_RX" || S_WAN_RX=''
+	case "$S_WAN_IF" in *[!A-Za-z0-9_.-]*) S_WAN_IF='' ;; esac
 	return 0
 }
 
@@ -324,6 +378,21 @@ save_state() {
 		echo "NOTIFY_AT=$S_NOTIFY_AT"
 		echo "NOTIFY_FAILS=$S_NOTIFY_FAILS"
 		echo "NO_NODE_AT=$S_NO_NODE_AT"
+		echo "DNS_AT=$S_DNS_AT"
+		echo "DNSM_FAIL_N=$S_DNSM_FAIL_N"
+		echo "RB_FAIL_N=$S_RB_FAIL_N"
+		echo "WAN_IF=$S_WAN_IF"
+		echo "TG_VIA_AT=$S_TG_VIA_AT"
+		echo "HUNG_NOTE=$S_HUNG_NOTE"
+		echo "ESC_N=$S_ESC_N"
+		echo "ESC_AT=$S_ESC_AT"
+		echo "HB_AT=$S_HB_AT"
+		echo "COMPAT=$S_COMPAT"
+		echo "COMPAT_AT=$S_COMPAT_AT"
+		echo "COMPAT_WHY=$S_COMPAT_WHY"
+		echo "UNK_N=$S_UNK_N"
+		echo "DNS_NOTE=$S_DNS_NOTE"
+		echo "UNK_AT=$S_UNK_AT"
 	} | write_atomic "$STATE_FILE"
 }
 
@@ -357,6 +426,55 @@ run_with_timeout() { # seconds cmd...
 	kill "$_killer" 2>/dev/null
 	wait "$_killer" 2>/dev/null
 	return "$_rc"
+}
+
+# Every ubus call is bounded (the default wait is 30 s).
+ubus_t() { ubus -t 5 "$@"; }
+
+# 0 while the detached action <name> is still running. The record holds
+# "pid started-at"; one older than an hour is ignored (the pid may have been
+# reused after the daemon crashed), and a finished action leaves an rc file.
+svc_busy() { # name
+	_bpf="$WD_STATE_DIR/child.$1"
+	_bpid='' _bat=''
+	[ -f "$_bpf" ] && read -r _bpid _bat <"$_bpf"
+	is_uint "$_bpid" && is_uint "$_bat" || return 1
+	[ -f "$_bpf.$_bat.rc" ] && return 1
+	[ $(($(now_s) - _bat)) -lt 3600 ] || return 1
+	kill -0 "$_bpid" 2>/dev/null
+}
+
+# Run an init action detached from the tick so a hung service cannot freeze the
+# whole daemon (WAN/Wi-Fi repair, notifications). Waits up to <seconds>; a still
+# running action is never killed (it may hold nft/sing-box), but a new one is not
+# started until it ends. Returns the action's exit status, 124 if it is still
+# running after <seconds>, 125 if an earlier run is still hanging.
+svc_run() { # name seconds cmd...
+	_sn=$1 _ss=$2
+	shift 2
+	_spf="$WD_STATE_DIR/child.$_sn"
+	svc_busy "$_sn" && return 125
+	# One rc file per run (named by its start time): a very old run that finally
+	# ends cannot be mistaken for the result of a newer one.
+	_sat=$(now_s)
+	_src="$_spf.$_sat.rc"
+	rm -f "$_spf" "$_spf".*.rc
+	# The subshell itself must not inherit our stdout/stderr or the lock fds.
+	( "$@" >/dev/null 2>&1 </dev/null
+		echo $? >"$_src.tmp" && mv -f "$_src.tmp" "$_src"
+	) >/dev/null 2>&1 </dev/null 8>&- 9>&- &
+	echo "$! $_sat" >"$_spf"
+	_si=0
+	while [ ! -f "$_src" ] && [ "$_si" -lt "$_ss" ]; do
+		sleep 1
+		_si=$((_si + 1))
+	done
+	[ -f "$_src" ] || return 124
+	_sr=1
+	read -r _sr <"$_src"
+	rm -f "$_spf" "$_src"
+	is_uint "$_sr" || _sr=1
+	return "$_sr"
 }
 
 mem_available_kb() {

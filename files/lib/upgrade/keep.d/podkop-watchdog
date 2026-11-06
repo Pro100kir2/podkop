@@ -1,1 +1,6 @@
 /etc/podkop-watchdog/
+/usr/lib/podkop-watchdog/
+/usr/bin/podkop-watchdog
+/etc/init.d/podkop-watchdog
+/etc/rc.d/S99podkop-watchdog
+/etc/rc.d/K05podkop-watchdog

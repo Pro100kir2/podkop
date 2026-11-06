@@ -1,6 +1,6 @@
 #!/bin/sh
 # podkop-watchdog: connectivity monitor and VLESS failover for Podkop.
-# Usage: podkop-watchdog run|tick|status|diagnose|test-candidates|events|notify-test
+# Usage: podkop-watchdog run|tick|status|diagnose|selfcheck|version|test-candidates|events|notify-test
 
 : "${WD_LIB_DIR:=/usr/lib/podkop-watchdog}"
 # Tests run with WD_STRICT=1 to catch unset variables; production stays resilient.
@@ -14,9 +14,31 @@ for _m in common checks api candidate machine notify; do
 	}
 done
 
+# CLI commands run beside the daemon: give them their own scratch directory so
+# they cannot read or delete the daemon's api.body / clash.out files.
+private_tmp() {
+	state_defaults # CLI commands do not load the daemon's state
+	TMP_DIR="$WD_STATE_DIR/cli.$$"
+	mkdir -p "$TMP_DIR" 2>/dev/null && chmod 700 "$TMP_DIR" 2>/dev/null
+	trap 'rm -rf "$TMP_DIR"' EXIT
+}
+
 acquire_lock() { # -n (fail fast)
 	exec 9>"$WD_LOCK_FILE" || return 1
 	flock -n 9
+}
+
+# After a respawn the previous instance may still be exiting (SIGKILLed, a child
+# of it holding the lock for a few seconds): wait instead of failing, otherwise
+# procd counts every such attempt as a crash and eventually gives up.
+acquire_lock_wait() { # seconds
+	exec 9>"$WD_LOCK_FILE" || return 1
+	_lw=0
+	while ! flock -n 9; do
+		[ "$_lw" -ge "$1" ] && return 1
+		sleep 2
+		_lw=$((_lw + 2))
+	done
 }
 
 cmd_run() {
@@ -26,7 +48,7 @@ cmd_run() {
 		exit 0
 	fi
 	ensure_dirs
-	if ! acquire_lock; then
+	if ! acquire_lock_wait "${WD_LOCK_WAIT:-60}"; then
 		log err "another instance is already running"
 		echo "podkop-watchdog: already running" >&2
 		exit 1
@@ -73,6 +95,7 @@ cmd_status() {
 cmd_diagnose() {
 	load_config
 	ensure_dirs
+	private_tmp
 	diagnose
 	echo "$S_D_SUMMARY" | tr ',' '\n'
 	if api_req GET /health && [ "$(json_field status)" = ok ]; then
@@ -88,6 +111,7 @@ cmd_diagnose() {
 cmd_test_candidates() {
 	load_config
 	ensure_dirs
+	private_tmp
 	exec 8>"$WD_LOCK_FILE.test"
 	if ! flock -n 8; then
 		echo "a candidate test is already running" >&2
@@ -122,6 +146,7 @@ cmd_events() {
 cmd_notify_test() {
 	load_config
 	ensure_dirs
+	private_tmp
 	if ! notify_enabled; then
 		echo "notifications are not configured (notify, telegram_token, telegram_chat_id)" >&2
 		exit 1
@@ -131,6 +156,8 @@ cmd_notify_test() {
 		echo "a candidate test is running; try again later" >&2
 		exit 1
 	}
+	# shellcheck disable=SC2034 # read by tg_send
+	NOTIFY_FORCE_VIA=1
 	if tg_send "[$(router_name)] Проверка уведомлений podkop-watchdog: всё работает."; then
 		echo "sent"
 	else
@@ -139,8 +166,76 @@ cmd_notify_test() {
 	fi
 }
 
+cmd_version() {
+	_v=$(cat "$WD_LIB_DIR/VERSION" 2>/dev/null)
+	echo "podkop-watchdog ${_v:-dev}"
+}
+
+sc() { # level text
+	case "$1" in WARN) _sc_warn=$((_sc_warn + 1)) ;; FAIL) _sc_fail=$((_sc_fail + 1)) ;; esac
+	printf '%-5s %s\n' "$1" "$2"
+}
+
+# One-shot health report of the whole setup, in plain Russian: what works, what
+# is degraded and why. Exit status 1 only if something essential is missing.
+cmd_selfcheck() {
+	load_config
+	ensure_dirs
+	private_tmp
+	_sc_warn=0 _sc_fail=0
+	cmd_version
+	for _t in jq curl uci ubus nslookup flock ping md5sum awk sed logger sing-box; do
+		command -v "$_t" >/dev/null 2>&1 || sc FAIL "нет команды '$_t' (установите пакет, который её содержит)"
+	done
+	if [ -x "$WD_PODKOP_INIT" ]; then sc OK "Podkop установлен"; else sc FAIL "Podkop не найден ($WD_PODKOP_INIT)"; fi
+	_why=$(compat_probe)
+	if [ -z "$_why" ]; then
+		sc OK "совместимость с Podkop и sing-box: автопереключение узлов возможно"
+	else
+		sc WARN "автопереключение узлов будет отключено: $_why"
+	fi
+	wan_resolve
+	if wan_status; then
+		sc OK "WAN-интерфейс: $WAN_IF"
+	else
+		sc WARN "WAN-интерфейс не найден: ремонт WAN выключен, связь оценивается по пингам (задайте wan_interface)"
+	fi
+	if dnsmasq_running; then
+		sc OK "dnsmasq работает"
+	elif dnsmasq_managed; then
+		sc WARN "dnsmasq включён, но не запущен"
+	else
+		sc OK "dnsmasq выключен пользователем: watchdog его не трогает"
+	fi
+	case "$(node_check)" in
+	ok) sc OK "Clash API Podkop отвечает, узел проходит проверку" ;;
+	fail) sc WARN "Clash API отвечает, но активный узел не проходит проверку" ;;
+	*) sc WARN "Clash API Podkop недоступен: автопереключение узлов не сможет проверять VPN" ;;
+	esac
+	if [ -z "$(singbox_field '.experimental.clash_api.secret')" ] && [ -z "$(podkop_get settings.yacd_secret_key)" ]; then
+		[ -r "$WD_SINGBOX_CONFIG" ] && sc WARN "Clash API без пароля: доступен всем устройствам сети (включите yacd secret в Podkop)"
+	fi
+	if notify_enabled; then sc OK "Telegram-уведомления настроены"; else sc WARN "Telegram не настроен: вы не узнаете о сбоях и о смерти watchdog"; fi
+	if [ -e "$WD_WATCHDOG_DEV" ]; then
+		sc OK "аппаратный watchdog есть"
+	else
+		sc WARN "нет аппаратного watchdog: при зависании ядра роутер сам не перезагрузится"
+	fi
+	_free=$(df -Pk "$WD_PERSIST_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
+	if is_uint "$_free" && [ "$_free" -lt 256 ]; then sc WARN "мало места на flash для журнала событий (${_free} КБ)"; fi
+	_mem=$(mem_available_kb)
+	if [ "$_mem" -lt "$C_MIN_MEM_AVAILABLE_KB" ]; then sc WARN "мало свободной RAM (${_mem} КБ): проверки узлов будут откладываться"; fi
+	if [ "$_sc_fail" -gt 0 ]; then
+		echo "ИТОГ: есть критичные проблемы ($_sc_fail), предупреждений: $_sc_warn"
+		exit 1
+	fi
+	if [ "$_sc_warn" -gt 0 ]; then echo "ИТОГ: работает, предупреждений: $_sc_warn"; else echo "ИТОГ: всё в порядке"; fi
+}
+
 case "${1:-}" in
 run) cmd_run ;;
+version) cmd_version ;;
+selfcheck) cmd_selfcheck ;;
 tick) cmd_tick ;;
 status) cmd_status ;;
 diagnose) cmd_diagnose ;;
@@ -148,7 +243,7 @@ test-candidates) cmd_test_candidates ;;
 events) cmd_events "${2:-50}" ;;
 notify-test) cmd_notify_test ;;
 *)
-	echo "Usage: $0 run|tick|status|diagnose|test-candidates|events [N]|notify-test" >&2
+	echo "Usage: $0 run|tick|status|diagnose|selfcheck|version|test-candidates|events [N]|notify-test" >&2
 	exit 2
 	;;
 esac

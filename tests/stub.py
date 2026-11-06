@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -45,6 +46,11 @@ def host_of(url: str) -> str:
 
 def node(world: dict[str, Any], host: str) -> dict[str, bool]:
     return world["nodes"].get(host, {"isolated": False, "live": False})
+
+
+def link_up(world: dict[str, Any]) -> bool:
+    """Any uplink works: the primary WAN or a secondary interface."""
+    return bool(world["wan_up"] or world.get("secondary", {}).get("up", False))
 
 
 def active_live(world: dict[str, Any]) -> bool:
@@ -131,6 +137,13 @@ def cmd_podkop_init(args: list[str]) -> int:
     if action == "enabled":
         return 0 if world["podkop_enabled"] else 1
     record("podkop-init", args)
+    if action in ("reload", "restart", "start") and world.get("reload_hang"):
+        release = WORLD_DIR / "hang_release"
+        waited = 0.0
+        while not release.exists() and waited < 60:  # a hung init script, until the test releases it
+            time.sleep(0.2)
+            waited += 0.2
+        world = load()  # the test changed the world meanwhile: never write a stale snapshot back
     if action in ("reload", "restart", "start"):
         rcs = world.get("reload_rcs") or []
         if rcs:
@@ -154,7 +167,14 @@ def cmd_podkop_init(args: list[str]) -> int:
 def wifi_status(world: dict[str, Any]) -> dict[str, Any]:
     out = {}
     for name, r in world.get("wifi", {}).items():
-        ifaces = [{"section": f"if{i}", "ifname": f} for i, f in enumerate(r["ifaces"])] if r["up"] else []
+        ifaces = (
+            [
+                {"section": f"if{i}", "ifname": f, "config": {"mode": r.get("mode", "ap")}}
+                for i, f in enumerate(r["ifaces"])
+            ]
+            if r["up"]
+            else []
+        )
         out[name] = {
             "up": r["up"],
             "pending": r.get("pending", False),
@@ -185,6 +205,9 @@ def cmd_ubus_wireless(world: dict[str, Any], method: str, payload: str) -> int:
 
 def cmd_ubus(args: list[str]) -> int:
     world = load()
+    if args[:1] == ["-t"]:  # the daemon bounds every call with `ubus -t 5`
+        args = args[2:]
+    wan = world.get("wan_name", "wan")
     if args[0] == "list":
         name = args[1]
         for radio in world.get("wifi", {}).values():
@@ -206,7 +229,30 @@ def cmd_ubus(args: list[str]) -> int:
     if obj == "network.interface.lan":
         print(json.dumps({"ipv4-address": [{"address": "192.168.1.1"}]}))
         return 0
-    if obj != "network.interface.wan":
+    if obj == "network.interface" and method == "dump":
+        wan_if = {
+            "interface": wan,
+            "up": world["wan_up"],
+            "proto": world.get("wan_proto", "pppoe"),
+            "metric": 10,
+            "route": [{"target": "0.0.0.0", "mask": 0}] if world["wan_up"] else [],
+        }
+        lan_route = [{"target": "0.0.0.0", "mask": 0}] if world.get("lan_default") else []
+        lan_if = {"interface": "lan", "up": True, "proto": "static", "route": lan_route}
+        interfaces = [lan_if] if world.get("no_wan_interface") else [lan_if, wan_if]
+        sec = world.get("secondary")
+        if sec:
+            route = [{"target": "0.0.0.0", "mask": 0}] if sec["up"] else []
+            interfaces.append(
+                {"interface": sec["name"], "up": sec["up"], "proto": "dhcp", "metric": 20, "route": route}
+            )
+        print(json.dumps({"interface": interfaces}))
+        return 0
+    sec = world.get("secondary")
+    if sec and obj == f"network.interface.{sec['name']}":
+        print(json.dumps({"up": sec["up"], "autostart": True, "l3_device": "wwan0"}))
+        return 0
+    if world.get("no_wan_interface") or obj != f"network.interface.{wan}":
         return 4  # UBUS_STATUS_NOT_FOUND
     if method in ("down", "up"):
         record("ifctl", [method])
@@ -232,13 +278,18 @@ def cmd_ubus(args: list[str]) -> int:
 
 def cmd_ping(args: list[str]) -> int:
     world = load()
-    return 0 if world["wan_up"] and world["internet"] and not world.get("icmp_blocked") else 1
+    link = world["wan_up"] or world.get("secondary", {}).get("up", False)
+    return 0 if link and world["internet"] and not world.get("icmp_blocked") else 1
 
 
 def cmd_nslookup(args: list[str]) -> int:
     world = load()
     name, server = args[-2], args[-1]
-    if not (world["wan_up"] and world["internet"]) or not world["dns"].get(server, False):
+    if server == "127.0.0.1" and not world.get("dnsmasq", True) and not world.get("other_resolver"):
+        print(";; connection refused")
+        return 1
+    link = world["wan_up"] or world.get("secondary", {}).get("up", False)
+    if not (link and world["internet"]) or not world["dns"].get(server, False):
         print(";; connection timed out; no servers could be reached")
         return 1
     print(f"Server:\t\t{server}\nAddress:\t{server}:53\n\nNon-authoritative answer:")
@@ -255,6 +306,8 @@ def cmd_pidof(args: list[str]) -> int:
 
 def cmd_dnsmasq_init(args: list[str]) -> int:
     world = load()
+    if args[0] == "enabled":
+        return 0 if world.get("dnsmasq_enabled", True) else 1
     record("dnsmasq-init", args)
     world["dnsmasq"] = True
     if world.get("dnsmasq_restart_fixes", True):
@@ -279,6 +332,9 @@ def cmd_flock(args: list[str]) -> int:
 
 def cmd_sing_box(args: list[str]) -> int:
     world = load()
+    if args[:1] == ["version"]:
+        print(f"sing-box version {world.get('singbox_version', '1.12.4')}")
+        return 0
     cfg_path = args[args.index("-c") + 1]
     try:
         cfg = json.loads(Path(cfg_path).read_text())
@@ -294,12 +350,12 @@ def cmd_sing_box(args: list[str]) -> int:
     url = args[-1]
     if url.startswith("https://api.telegram.org/"):
         record("telegram", [tg_path(url)], via=host, text=tg_text(url))
-        if world["wan_up"] and world["internet"] and node(world, host)["isolated"]:
+        if link_up(world) and world["internet"] and node(world, host)["isolated"]:
             print('{"ok":true,"result":{}}')
             return 0
         return 1
     record("sing-box-fetch", [host])
-    if world["wan_up"] and world["internet"] and node(world, host)["isolated"]:
+    if link_up(world) and world["internet"] and node(world, host)["isolated"]:
         print("fl=1f1\nh=www.cloudflare.com\nip=203.0.113.9\n")
         return 0
     print('FATAL Get "https://www.cloudflare.com/cdn-cgi/trace": EOF', file=sys.stderr)
@@ -360,11 +416,24 @@ def cmd_curl(args: list[str]) -> int:
     parts = urlsplit(url)
     if parts.scheme == "http" and "/proxies/" in parts.path:
         record("clash", [parts.path])
+        for hdr in opts.get("-H", []):
+            if hdr.startswith("@") and not Path(hdr[1:]).exists():
+                return 26  # curl: failed to open the header file
+        if world.get("clash_secret"):
+            sent = ""
+            for hdr in opts.get("-H", []):
+                if hdr.startswith("@"):
+                    sent = Path(hdr[1:]).read_text()
+            if f"Bearer {world['clash_secret']}" not in sent:
+                return reply(401, '{"message":"Unauthorized"}')
+        probe = [v for v in opts.get("--data-urlencode", []) if v.startswith("url=")]
+        if any(bad in probe[0] for bad in world.get("clash_fail_urls", [])) if probe else False:
+            return reply(504, '{"message":"Timeout"}')
         if not world.get("clash_reachable", True) or not world["singbox"]:
             return reply(0, "", rc=7)
-        if parts.path != "/proxies/main-out/delay":
+        if parts.path != f"/proxies/{world.get('clash_tag', 'main-out')}/delay":
             return reply(404, '{"message":"Resource not found"}')
-        if active_live(world) and world["wan_up"] and world["internet"]:
+        if active_live(world) and link_up(world) and world["internet"]:
             return reply(200, '{"delay":120}')
         return reply(504, '{"message":"Timeout"}')
 
@@ -373,7 +442,7 @@ def cmd_curl(args: list[str]) -> int:
         if parts.path != "/check":
             return reply(404, "404 Not Found")  # like the real server
         ok = (
-            world["wan_up"]
+            link_up(world)
             and world["internet"]
             and world["dns"].get("127.0.0.1")
             and world["nft"]
@@ -389,7 +458,7 @@ def cmd_curl(args: list[str]) -> int:
         m = re.search(r'url = "([^"]+)"', conf)
         tg_url = m.group(1) if m else ""
         record("telegram", [tg_path(tg_url)], via="direct", text=tg_text(tg_url))
-        if world["wan_up"] and world["internet"] and world.get("tg_direct", False):
+        if link_up(world) and world["internet"] and world.get("tg_direct", False):
             sys.stdout.write('{"ok":true,"result":{}}')
             return 0
         return 28
@@ -402,7 +471,7 @@ def cmd_curl(args: list[str]) -> int:
         path = urlsplit(url).path[len("/api") :]
         key = f"{method} {path}"
         record("api", [key], query=parts.query, resolve=opts.get("--resolve", []))
-        if not (world["wan_up"] and world["internet"]):
+        if not (link_up(world) and world["internet"]):
             return reply(0, "", rc=6)
         queue = world["api"].get(key)
         if not queue:

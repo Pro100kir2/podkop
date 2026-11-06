@@ -191,7 +191,7 @@ def test_undeliverable_notifications_are_queued_and_capped(router: Router) -> No
     assert 1 <= len(lines) <= 30 and lines[-1].endswith("Перезапустил dnsmasq.")
     assert router.logs().count("Telegram notification not delivered") == 1
     router.set_node("a.example", isolated=True, live=True)
-    router.run_until(lambda st: not q.read_text().strip(), max_steps=30)
+    router.run_until(lambda st: not q.read_text().strip(), max_steps=80)
     assert "Telegram notifications delivered again" in router.logs()
 
 
